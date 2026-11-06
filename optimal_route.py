@@ -1,15 +1,17 @@
 """Search for the optimal production route of a desired isotope (DI).
 
 For a DI with mass number A, the script runs isotopia_py for every candidate
-target with mass number A..A+5 and every beam energy on a linear grid, and
-ranks the (target, projectile, energy) routes by the DI activity at the end
-of cooling.
+target with mass number A-5..A+5 and every beam energy on a linear grid. Each
+route reports the mass of the DI produced (g) at end of irradiation and at end
+of cooling, and the initial mass production rate; routes are ranked by the
+--metric chosen (default: mass at end of cooling). Stable and radioactive DIs
+are handled the same way, because the masses come from ISOTOPIA's atom counts.
 
     python scripts/optimal_route.py Tc99_m1 --projectile p --de 1 --thickness 0.05
     python scripts/optimal_route.py Cu64 -p p d --de 0.5 --exclude blacklist.txt --jobs 4
 
 Outputs (in --out, default runs/optimal_route/<DI>):
-    scan.csv     one row per run (route, Ebeam, Eback, activities, status)
+    scan.csv     one row per run (route, Ebeam, Eback, masses, status)
     summary.txt  assumptions, best route per target, overall best, warnings
 
 How each projectile is treated
@@ -48,15 +50,17 @@ from scipy.integrate import cumulative_trapezoid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from isotopia_py.constants import NUC, NUMTIME, PARSYM, PARZ, RHOTABLE, nuc  # noqa: E402
+from isotopia_py.constants import AVOGADRO, NUC, NUMTIME, PARA, PARMASS, PARSYM, PARZ, RHOTABLE, nuc  # noqa: E402
+from isotopia_py.fortran import endf_float  # noqa: E402
 from isotopia_py.inputdeck import machine  # noqa: E402
 from isotopia_py.rates import stoppingpower  # noqa: E402
 from isotopia_py.run import run  # noqa: E402
 from isotopia_py.state import IsotopiaError, State  # noqa: E402
 
-MASS_WINDOW = 5          # targets have mass number A_DI .. A_DI + MASS_WINDOW
+MASS_WINDOW = 5          # targets have mass number A_DI - MASS_WINDOW .. A_DI + MASS_WINDOW
 ZDEPTH_DEFAULT = 10      # ISOTOPIA default Zdepth (input.f90); limits which Z it computes
-STABLE_HALFLIFE = 1e17   # s; ISOTOPIA treats longer half-lives as stable (decaydata.f90)
+ADEPTH_DEFAULT = 20      # ISOTOPIA default Adepth (input.f90); limits which A it computes
+NEUTRON_MASS_U = PARMASS[1]   # u; neutron mass from isotopia_py.constants (constants.f90)
 
 Nuclide = tuple[int, int, int | None]   # (Z, A, I); I = None means "any state"
 
@@ -144,12 +148,18 @@ def natural_masses(path: str, Z: int) -> set[int]:
 
 def candidate_targets(di: Nuclide, k0: int, path: str, crosspath: str,
                       include_radioactive: bool, warnings: list[str]) -> list[Target]:
-    """Library targets with A_DI <= A <= A_DI + 5 whose ISOTOPIA Z window contains the DI.
+    """Library targets with A_DI - 5 <= A <= A_DI + 5 whose ISOTOPIA window contains the DI.
 
-    ISOTOPIA computes residuals for Z from Zcomp + 1 down to Zcomp - Zdepth,
-    with Zcomp = Ztarget + Zprojectile and Zdepth = min(10, Ztarget - 1)
-    (reacinitial.f90, checkvalue.f90). Targets outside that window cannot
-    produce the DI in the code and are not run.
+    ISOTOPIA computes residuals for Z from Zcomp + 1 down to Zcomp - Zdepth and
+    for A from Acomp down to Acomp - Adepth, with Zcomp = Ztarget + Zprojectile,
+    Acomp = Atarget + Aprojectile, Zdepth = min(10, Ztarget - 1) and
+    Adepth = min(20, Atarget - 1) (reacinitial.f90, checkvalue.f90).
+
+    A reaction can raise the mass number by at most Aprojectile (capture of
+    the whole projectile), so a lighter target can only reach the DI if
+    Atarget + Aprojectile >= A_DI. Targets that fail either window cannot
+    produce the DI in the code; they are not run, and lighter targets
+    dropped this way are reported in `warnings`.
     """
     Zdi, Adi, _ = di
     libdir = Path(crosspath) / PARSYM[k0]
@@ -158,25 +168,69 @@ def candidate_targets(di: Nuclide, k0: int, path: str, crosspath: str,
     pattern = re.compile(r"^([A-Z][a-z]?)(\d{3})(m|n)?$")
     symbols = [s.strip() for s in NUC]
     targets = []
+    too_light: list[str] = []
     for entry in sorted(os.listdir(libdir)):
         m = pattern.match(entry)
         if not m or m.group(1) not in symbols:
             continue
         Z, A = symbols.index(m.group(1)) + 1, int(m.group(2))
-        if not Adi <= A <= Adi + MASS_WINDOW:
+        if abs(A - Adi) > MASS_WINDOW:
             continue
         if m.group(3):
             warnings.append(f"{PARSYM[k0]}: isomeric target {entry} skipped "
                             "(isotopia_py input deck cannot take isomeric targets)")
             continue
-        Zcomp = Z + PARZ[k0]
+        if (Z, A) == (Zdi, Adi) and di[2] in (0, None):
+            # The DI's own ground state as target: ISOTOPIA's inventory for it is the
+            # unreacted target (it only depletes), not production. An isomeric DI from
+            # its own ground state (e.g. Tc-99 -> Tc-99m by inelastic scattering) is kept.
+            warnings.append(f"{PARSYM[k0]}: target {entry} skipped (it is the DI itself)")
+            continue
+        Zcomp, Acomp = Z + PARZ[k0], A + PARA[k0]
         if not Zcomp - min(ZDEPTH_DEFAULT, Z - 1) <= Zdi <= Zcomp + 1:
+            continue
+        if not Acomp - min(ADEPTH_DEFAULT, A - 1) <= Adi <= Acomp:
+            if Adi > Acomp:
+                too_light.append(entry)
             continue
         stable = A in natural_masses(path, Z)
         if not stable and not include_radioactive:
             continue
         targets.append(Target(Z, A, stable))
+    if too_light:
+        warnings.append(f"{PARSYM[k0]}: {len(too_light)} lighter targets skipped, A + {PARA[k0]} < "
+                        f"{Adi} so they cannot reach the DI mass: {', '.join(too_light)}")
     return targets
+
+
+# ----------------------------------------------------------------------------
+# Atomic mass of the DI (for atoms -> grams)
+# ----------------------------------------------------------------------------
+
+def molar_mass(path: str, Z: int, A: int) -> float:
+    """Molar mass of nuclide (Z, A) in g/mol, from ISOTOPIA's decay library.
+
+    Every nuclide in files/decay/zZZZ (JEFF-3.1.1, ENDF-6 format), stable ones
+    included, starts with an MF1/MT451 record whose first line holds ZA and
+    AWR, the atomic mass in units of the neutron mass (ENDF-6 manual, Sec. 1.1).
+    The atomic mass is AWR * m_n, and in g/mol it equals the mass in u.
+
+    Raises
+    ------
+    LookupError
+        If the file or the nuclide's record is missing (data must come from
+        the library, so the search stops and reports it).
+    """
+    decayfile = Path(path) / "files" / "decay" / f"z{Z:03d}"
+    if not decayfile.exists():
+        raise LookupError(f"decay file {decayfile} not found")
+    za = 1000 * Z + A
+    with open(decayfile, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            # First line of an MF1/MT451 section: ZA in columns 1-11, AWR in 12-22
+            if line[71:80] == "1451    1" and round(endf_float(line[0:11])) == za:
+                return endf_float(line[11:22]) * NEUTRON_MASS_U
+    raise LookupError(f"no record (AWR) for {nuclide_name(Z, A, None)} in {decayfile}")
 
 
 # ----------------------------------------------------------------------------
@@ -240,6 +294,7 @@ class RunSpec:
     eback: float | None          # MeV; charged particles only
     lines: list[str]
     exclude: set[Nuclide] = field(default_factory=set)
+    molar_mass: float = 0.0      # g/mol of the DI, from molar_mass()
 
 
 def di_key(st: State, di: Nuclide) -> tuple[int, int, int] | None:
@@ -269,11 +324,12 @@ def precursors(st: State, di: Nuclide) -> list[tuple[int, int, int]]:
 
 
 def run_one(spec: RunSpec) -> dict:
-    """Run isotopia_py once and extract the DI activities; never raises."""
+    """Run isotopia_py once and extract the DI masses; never raises."""
     t = spec.target
     row = {"projectile": PARSYM[spec.k0], "target": t.name, "stable": t.stable,
            "Ebeam_MeV": spec.ebeam, "Eback_MeV": spec.eback, "Leff_cm": None,
-           "A_EOI_Bq": None, "A_EOC_Bq": None, "status": "ok", "note": ""}
+           "m_rate": None, "m_rate_unit": rate_unit(spec.k0),
+           "m_EOI_g": None, "m_EOC_g": None, "status": "ok", "note": ""}
     try:
         with tempfile.TemporaryDirectory() as tmp:
             st = run(spec.lines, out=io.StringIO(), outdir=tmp)
@@ -295,15 +351,27 @@ def run_one(spec: RunSpec) -> dict:
         row.update(status="not_produced",
                    note="no positive DI cross section between Eback and Ebeam for this target")
         return row
-    if float(st.Thalf[key]) >= STABLE_HALFLIFE:
-        row.update(status="no_data", note=f"no half-life for DI in files/decay/z{key[0]:03d} "
-                                          "(treated as stable, activity = 0)")
-        return row
-    # End of cooling is the last time point; with Tcool = 0 there is no cooling grid
-    i_eoc = NUMTIME if st.Tco > 0 else st.Ntime
-    row["A_EOI_Bq"] = float(st.activity[key][st.Ntime])
-    row["A_EOC_Bq"] = float(st.activity[key][i_eoc])
+
+    # Masses from ISOTOPIA's atom counts N_DI(t) (st.Niso, kinetics.equations):
+    # m = N * M / N_A. Atom counts exist for stable and radioactive nuclides alike.
+    N = st.Niso[key]
+    g_per_atom = spec.molar_mass / float(AVOGADRO)
+    i_eoc = NUMTIME if st.Tco > 0 else st.Ntime   # with Tcool = 0 there is no cooling grid
+    row["m_EOI_g"] = float(N[st.Ntime]) * g_per_atom
+    row["m_EOC_g"] = float(N[i_eoc]) * g_per_atom
+
+    # Initial mass production rate: slope of N over the first time step, the
+    # same finite difference ISOTOPIA uses for its activity yield (kinetics.activities),
+    # normalised the same way: per mA of beam (charged) or per g of target (n, g).
+    dt_h = float(st.Tgrid[1] - st.Tgrid[0]) / 3600.0
+    per = float(st.Ibeam) * 1e3 if spec.k0 > 1 else float(st.M_target)   # mA or g
+    row["m_rate"] = float(N[1] - N[0]) * g_per_atom / (per * dt_h)
     return row
+
+
+def rate_unit(k0: int) -> str:
+    """Unit of m_rate for projectile index k0 (matches ISOTOPIA's yield normalisation)."""
+    return "g/(mA h)" if k0 > 1 else "g/(g h)"
 
 
 # ----------------------------------------------------------------------------
@@ -390,21 +458,39 @@ def library_emin(crosspath: str, k0: int, t: Target) -> float | None:
 # ----------------------------------------------------------------------------
 
 CSV_FIELDS = ["projectile", "target", "stable", "Ebeam_MeV", "Eback_MeV", "Leff_cm",
-              "A_EOI_Bq", "A_EOC_Bq", "status", "note"]
+              "m_rate", "m_rate_unit", "m_EOI_g", "m_EOC_g", "status", "note"]
+
+# Ranking options: --metric name -> (CSV column, description)
+METRICS = {
+    "eoc": ("m_EOC_g", "DI mass at end of cooling [g]"),
+    "eoi": ("m_EOI_g", "DI mass at end of irradiation [g]"),
+    "rate": ("m_rate", "initial mass production rate [g/(mA h); g/(g h) for n and g]"),
+}
 
 ASSUMPTIONS = """\
 Assumptions and limitations
-- Figure of merit: DI activity at end of cooling (Bq), last point of ISOTOPIA's time grid.
-- Targets: mass number A_DI..A_DI+5, ground state, with a cross-section library;
-  only Z inside ISOTOPIA's residual window (Zcomp+1 .. Zcomp-Zdepth, Zdepth = 10).
+- Reported for every route: DI mass at EOI and at end of cooling (last point of
+  ISOTOPIA's time grid), and the initial mass production rate. Ranking uses the
+  chosen metric. Masses are m = N * M / N_A, with N the atom count ISOTOPIA
+  computes and M = AWR * m_n read from the DI's record in files/decay/zZZZ.
+- Stable and radioactive DIs are treated alike. Masses are of the DI alone: for a
+  stable DI, other isotopes of the same element (including the target, if it is
+  the same element) cannot be separated chemically, and isotopic purity is not
+  reported yet.
+- The mass rate is per mA h of beam for charged particles; for neutrons and
+  photons ISOTOPIA normalises per gram of target, so rates are not comparable
+  across those groups.
+- Targets: mass number A_DI-5..A_DI+5, ground state, with a cross-section library;
+  only Z and A inside ISOTOPIA's residual window (Zcomp+1 .. Zcomp-Zdepth,
+  Acomp .. Acomp-Adepth); lighter targets need A + A_projectile >= A_DI.
 - Charged particles: Eback from a fixed thickness using ISOTOPIA's Bethe-Bloch
   stopping power and default density; Leff_cm is the path length ISOTOPIA itself
   computed (100-bin midpoint rule) and may differ slightly from the thickness.
 - Decay physics is the Phase 1 port of equations.f90, including its known defects
   (claude/equations_f90_findings.md): beta- parents do NOT feed daughters during
   cooling, no branching ratios, double-counted parent feeding, no isomeric
-  transition. End-of-cooling activities of DIs fed by beta- decay are therefore
-  underestimated; compare A_EOI_Bq where this matters.
+  transition. End-of-cooling masses of DIs fed by beta- decay (including stable
+  DIs made mostly by decay) are therefore underestimated; compare m_EOI_g.
 - Exclusion checks the target and the one-step decay precursors ISOTOPIA models;
   longer chains are not tracked by the code.
 - Radiotoxicity and processing time are not part of the ranking yet.
@@ -419,6 +505,22 @@ def _fmt(v) -> str:
     return str(v)
 
 
+def best_per_route(rows: list[dict], col: str) -> dict[tuple[str, str], dict]:
+    """Row with the largest `col` value for each (projectile, target) route."""
+    best: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        k = (r["projectile"], r["target"])
+        if k not in best or r[col] > best[k][col]:
+            best[k] = r
+    return best
+
+
+def _route(r: dict, di_name: str) -> str:
+    """One-line route description, e.g. 'Mo100(p,x)Tc99_m1 at Ebeam = 20 MeV'."""
+    e = "reactor spectrum" if r["Ebeam_MeV"] is None else f"Ebeam = {r['Ebeam_MeV']:.4g} MeV"
+    return f"{r['target']}({r['projectile']},x){di_name} at {e}"
+
+
 def write_outputs(outdir: Path, di_name: str, rows: list[dict], warnings: list[str], args) -> str:
     """Write scan.csv and summary.txt; return the summary text."""
     outdir.mkdir(parents=True, exist_ok=True)
@@ -428,35 +530,40 @@ def write_outputs(outdir: Path, di_name: str, rows: list[dict], warnings: list[s
         for r in rows:
             w.writerow({k: _fmt(r.get(k)) for k in CSV_FIELDS})
 
-    ok = [r for r in rows if r["status"] == "ok" and r["A_EOC_Bq"] is not None]
+    col, desc = METRICS[args.metric]
+    ok = [r for r in rows if r["status"] == "ok" and r[col] is not None]
     settings = (f"Projectiles: {' '.join(args.projectile)}   grid: {args.emin}-{args.emax} MeV, "
                 f"step {args.de} MeV   thickness: {args.thickness} cm")
     beam = (f"Ibeam: {args.ibeam} mA   Tirrad: {args.tirrad}   Tcool: {args.tcool}   "
             f"exclusion list: {args.exclude or 'none'}")
-    out = [f"Optimal route search for {di_name}", "", settings, beam, "", ASSUMPTIONS]
+    out = [f"Optimal route search for {di_name}", "", settings, beam,
+           f"Ranked by: {desc}", "", ASSUMPTIONS]
 
-    # Best energy per (projectile, target), sorted by activity
-    best: dict[tuple[str, str], dict] = {}
-    for r in ok:
-        k = (r["projectile"], r["target"])
-        if k not in best or r["A_EOC_Bq"] > best[k]["A_EOC_Bq"]:
-            best[k] = r
-    ranked = sorted(best.values(), key=lambda r: r["A_EOC_Bq"], reverse=True)
-    out.append("Best energy per route (ranked by DI activity at end of cooling)")
+    # Best energy per (projectile, target) under the chosen metric, then rank the routes
+    best = best_per_route(ok, col)
+    ranked = sorted(best.values(), key=lambda r: r[col], reverse=True)
+    out.append(f"Best energy per route (ranked by {desc})")
     out.append(f"{'proj':>4} {'target':>8} {'stable':>6} {'Ebeam':>9} {'Eback':>9} "
-               f"{'A_EOI [Bq]':>12} {'A_EOC [Bq]':>12}")
+               f"{'rate':>11} {'rate unit':>10} {'m_EOI [g]':>11} {'m_EOC [g]':>11}")
     for r in ranked:
         out.append(f"{r['projectile']:>4} {r['target']:>8} {'yes' if r['stable'] else 'no':>6} "
                    f"{_fmt(r['Ebeam_MeV']):>9} {_fmt(r['Eback_MeV']):>9} "
-                   f"{r['A_EOI_Bq']:12.4e} {r['A_EOC_Bq']:12.4e}")
+                   f"{r['m_rate']:11.4e} {r['m_rate_unit']:>10} {r['m_EOI_g']:11.4e} {r['m_EOC_g']:11.4e}")
     out.append("")
-    if ranked and ranked[0]["A_EOC_Bq"] > 0:
+    if ranked and ranked[0][col] > 0:
         r = ranked[0]
-        e = "reactor spectrum" if r["Ebeam_MeV"] is None else f"Ebeam = {r['Ebeam_MeV']:.4g} MeV"
-        out.append(f"OPTIMAL: {r['target']}({r['projectile']},x){di_name}, {e}, "
-                   f"A_EOC = {r['A_EOC_Bq']:.4e} Bq")
+        out.append(f"OPTIMAL ({args.metric}): {_route(r, di_name)}, m_EOC = {r['m_EOC_g']:.4e} g, "
+                   f"rate = {r['m_rate']:.4e} {r['m_rate_unit']}")
     else:
-        out.append("OPTIMAL: none - no route produced the DI with nonzero activity")
+        out.append("OPTIMAL: none - no route produced the DI")
+
+    # Cross-check: the best route under every metric. Disagreement means half-life
+    # and timing, not the cross section alone, are deciding the choice.
+    out.append("Best route under each metric:")
+    for name, (c, _) in METRICS.items():
+        cands = [r for r in ok if r[c] is not None and r[c] > 0]
+        top = max(cands, key=lambda r: r[c]) if cands else None
+        out.append(f"  {name:>5}: {_route(top, di_name) if top else 'none'}")
     out.append("")
 
     # Counts of non-ok runs, then warnings
@@ -500,6 +607,9 @@ def parse_args(argv=None):
     ap.add_argument("--exclude", default=None, help="text file of nuclides that exclude a route")
     ap.add_argument("--include-radioactive", action="store_true",
                     help="also use non-naturally-occurring (radioactive) targets")
+    ap.add_argument("--metric", choices=list(METRICS), default="eoc",
+                    help="ranking: eoc = DI mass at end of cooling (default), eoi = DI mass at "
+                         "end of irradiation, rate = initial mass production rate")
     ap.add_argument("--jobs", type=int, default=1, help="parallel worker processes (default 1)")
     ap.add_argument("--out", default=None, help="output directory (default runs/optimal_route/<DI>)")
     args = ap.parse_args(argv)
@@ -520,9 +630,18 @@ def main(argv=None) -> int:
     warnings: list[str] = []
     if listed(*di, exclude):
         warnings.append(f"the DI {di_name} itself is on the exclusion list")
+    groups = {p in "pdtha" for p in args.projectile}
+    if args.metric == "rate" and len(groups) > 1:
+        warnings.append("--metric rate mixes g/(mA h) (charged particles) with g/(g h) "
+                        "(n, g); the ranking across those groups is not meaningful")
 
     paths = State()
     machine(paths)                             # resolves ISOTOPIA_DIR / ISOTOPIA_LIBS
+    try:
+        M_di = molar_mass(paths.path, di[0], di[1])   # g/mol, from the decay library
+    except LookupError as exc:
+        print(f"error: cannot convert atoms to grams for {di_name}: {exc}", file=sys.stderr)
+        return 1
     grid = energy_grid(args.emin, args.emax, args.de)
     specs: list[RunSpec] = []
     rows: list[dict] = []
@@ -531,7 +650,7 @@ def main(argv=None) -> int:
         targets = candidate_targets(di, k0, paths.path, paths.crosspath,
                                     args.include_radioactive, warnings)
         if not targets:
-            warnings.append(f"{p}: no candidate targets with A = {di[1]}..{di[1] + MASS_WINDOW} "
+            warnings.append(f"{p}: no candidate targets with A = {di[1] - MASS_WINDOW}..{di[1] + MASS_WINDOW} "
                             f"in {paths.crosspath}{p}/")
         for t in targets:
             emin_lib = library_emin(paths.crosspath, k0, t)
@@ -539,6 +658,8 @@ def main(argv=None) -> int:
                 warnings.append(f"{p}+{t.name}: library cross sections start at {emin_lib:g} MeV; "
                                 "lower beam energies give zero reaction rates")
         s, skipped = build_specs(di, k0, targets, grid, args, exclude, warnings)
+        for spec in s:
+            spec.molar_mass = M_di
         specs += s
         rows += skipped
 
