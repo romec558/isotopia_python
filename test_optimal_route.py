@@ -1,11 +1,12 @@
 """Tests for scripts/optimal_route.py.
 
-The first group needs no data. The last test needs ISOTOPIA_DIR and the proton
-library for Mo-100 (skipped otherwise).
+The first group needs no data. The last group needs ISOTOPIA_DIR and the proton
+library for Mo-100 and Ru-101 (skipped otherwise).
 """
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import sys
 from pathlib import Path
@@ -58,6 +59,69 @@ def test_energy_grid():
     assert opt.energy_grid(1.0, 3.0, 0.5).tolist() == [1.0, 1.5, 2.0, 2.5, 3.0]
 
 
+def test_candidate_targets_mass_window(tmp_path):
+    """Targets span A-5..A+5; lighter ones that cannot reach A_DI (A + 1 < A_DI
+    for protons) are skipped with a warning, isomeric targets are skipped."""
+    lib = tmp_path / "libs"
+    for name in ("Mo094", "Mo098", "Mo100", "Ru104", "Ru105", "Tc099m"):
+        (lib / "p" / name).mkdir(parents=True)
+    ab = tmp_path / "code" / "files" / "abundance"
+    ab.mkdir(parents=True)
+    (ab / "z042").write_text("".join(f"{42:4d}{a:4d}{10.0:11.6f}\n" for a in (94, 98, 100)))
+    (ab / "z044").write_text(f"{44:4d}{104:4d}{10.0:11.6f}\n")
+    warnings: list[str] = []
+    targets = opt.candidate_targets((43, 99, 1), 2, str(tmp_path / "code"), str(lib), False, warnings)
+    assert [t.name for t in targets] == ["Mo98", "Mo100", "Ru104"]
+    assert any("Mo094" in w and "cannot reach" in w for w in warnings)
+    assert any("Tc099m" in w for w in warnings)
+    # The DI's own ground state is not a production route; its isomer from it is
+    warnings.clear()
+    (lib / "p" / "Tc099").mkdir()
+    (ab / "z043").write_text(f"{43:4d}{99:4d}{10.0:11.6f}\n")
+    names = [t.name for t in opt.candidate_targets((43, 99, 0), 2, str(tmp_path / "code"), str(lib),
+                                                   False, warnings)]
+    assert "Tc99" not in names and any("is the DI itself" in w for w in warnings)
+    names = [t.name for t in opt.candidate_targets((43, 99, 1), 2, str(tmp_path / "code"), str(lib),
+                                                   False, [])]
+    assert "Tc99" in names
+
+
+# ---------------------------------------------------------------- ranking metrics
+
+def _row(target, ebeam, rate, eoi, eoc):
+    return {"projectile": "p", "target": target, "stable": True, "Ebeam_MeV": ebeam,
+            "Eback_MeV": ebeam - 5, "Leff_cm": 0.05, "m_rate": rate, "m_rate_unit": "g/(mA h)",
+            "m_EOI_g": eoi, "m_EOC_g": eoc, "status": "ok", "note": ""}
+
+
+def test_metric_choice_changes_ranking(tmp_path):
+    """Route A wins on initial rate and EOI mass, route B on end-of-cooling mass;
+    the summary names the winner of the chosen metric and lists all three."""
+    rows = [_row("Aa10", 20.0, 9e-6, 1e-4, 1e-6), _row("Aa10", 30.0, 1e-6, 1e-5, 1e-7),
+            _row("Bb10", 25.0, 1e-6, 5e-5, 3e-5)]
+    for metric, winner in (("rate", "Aa10"), ("eoi", "Aa10"), ("eoc", "Bb10")):
+        args = opt.parse_args(["Tc99_m1", "-p", "p", "--de", "1", "--metric", metric])
+        text = opt.write_outputs(tmp_path / metric, "Tc99_m1", rows, [], args)
+        optimal = next(ln for ln in text.splitlines() if ln.startswith("OPTIMAL"))
+        assert f"OPTIMAL ({metric}): {winner}" in optimal
+        assert "rate: Aa10(p,x)Tc99_m1 at Ebeam = 20 MeV" in text
+        assert "eoc: Bb10(p,x)Tc99_m1 at Ebeam = 25 MeV" in text
+    header = (tmp_path / "eoc" / "scan.csv").read_text().splitlines()[0]
+    assert "m_EOC_g" in header and "m_rate" in header and "Bq" not in header
+
+
+def test_molar_mass_from_endf_record(tmp_path):
+    """AWR is read from the MF1/MT451 first line of the decay file; a nuclide
+    without a record stops with LookupError instead of a guessed mass."""
+    d = tmp_path / "files" / "decay"
+    d.mkdir(parents=True)
+    head = " 4.210000+4 9.900000+1         -1          0          2          11000 1451    1\n"
+    (d / "z042").write_text(head)
+    assert opt.molar_mass(str(tmp_path), 42, 100) == pytest.approx(99.0 * opt.NEUTRON_MASS_U)
+    with pytest.raises(LookupError, match="Mo101"):
+        opt.molar_mass(str(tmp_path), 42, 101)
+
+
 # ---------------------------------------------------------------- Eback solver
 
 def test_eback_analytic(monkeypatch):
@@ -88,21 +152,56 @@ ISOTOPIA = Path(os.environ.get("ISOTOPIA_DIR") or ROOT.parent / "isotopia")
 needs_lib = pytest.mark.skipif(not (ISOTOPIA / "files").is_dir(), reason="ISOTOPIA_DIR not set")
 
 
+def _paths():
+    st = opt.State()
+    opt.machine(st)
+    return st
+
+
+def _proton_lines(sym, A, ebeam, eback):
+    return ["projectile p", f"element {sym}", f"mass {A}", "Ibeam 1", "Tirrad 1 d", "Tcool 1 d",
+            f"Ebeam {ebeam}", f"Eback {eback:.6f}"]
+
+
 @needs_lib
-def test_mo100_route_and_precursor_exclusion():
-    """p + Mo-100 at 20 MeV makes Tc-99m; Mo-99 feeds it by beta- decay in the
-    model, so listing Mo99 must exclude the route. ISOTOPIA's own Leff must match
-    the requested thickness."""
-    st_paths = opt.State()
-    opt.machine(st_paths)
+def test_mo100_route_mass_and_precursor_exclusion(tmp_path):
+    """p + Mo-100 at 20 MeV makes Tc-99m. Its mass must equal (activity / lambda)
+    * M / N_A from the same run; listing Mo99 (a beta- precursor) must exclude the
+    route; ISOTOPIA's own Leff must match the requested thickness."""
+    paths = _paths()
     t = opt.Target(42, 100, True)
-    solver = opt.EbackSolver(2, 42, 100)
-    eback, _ = solver.eback(20.0, 0.05)
-    lines = ["projectile p", "element Mo", "mass 100", "Ibeam 1", "Tirrad 1 d", "Tcool 1 d",
-             "Ebeam 20.0", f"Eback {eback:.6f}"]
+    eback, _ = opt.EbackSolver(2, 42, 100).eback(20.0, 0.05)
+    lines = _proton_lines("Mo", 100, 20.0, eback)
     di = (43, 99, 1)
-    row = opt.run_one(opt.RunSpec(di, 2, t, 20.0, eback, lines))
-    assert row["status"] == "ok" and row["A_EOC_Bq"] > 0
+    M = opt.molar_mass(paths.path, 43, 99)
+    assert abs(M - 99) / 99 < 0.01                    # sanity: close to the mass number
+    row = opt.run_one(opt.RunSpec(di, 2, t, 20.0, eback, lines, molar_mass=M))
+    assert row["status"] == "ok" and row["m_EOC_g"] > 0
     assert row["Leff_cm"] == pytest.approx(0.05, rel=1e-3)
-    row = opt.run_one(opt.RunSpec(di, 2, t, 20.0, eback, lines, {(42, 99, None)}))
+    st = opt.run(lines, out=io.StringIO(), outdir=str(tmp_path))
+    key = (43, 99, 1)
+    N_eoc = float(st.activity[key][opt.NUMTIME]) / float(st.lam[key])
+    assert row["m_EOC_g"] == pytest.approx(N_eoc * M / float(opt.AVOGADRO), rel=1e-5)
+    row = opt.run_one(opt.RunSpec(di, 2, t, 20.0, eback, lines, {(42, 99, None)}, M))
     assert row["status"] == "excluded" and "Mo99" in row["note"]
+
+
+@needs_lib
+def test_stable_di_mass(tmp_path):
+    """Stable Ru-100 from p + Ru-101 at 30 MeV: previously rejected (no activity),
+    now reported as a mass. A stable product cannot decay, so its mass cannot
+    drop during cooling. Analytic check of the rate: at early times N = N_0 R t
+    for direct production, so the first-step rate is N_0 R M / N_A per mA h.
+    Tolerance 5%: beta+ feeding from Rh-100 adds a small second-order term."""
+    paths = _paths()
+    t = opt.Target(44, 101, True)
+    eback, _ = opt.EbackSolver(2, 44, 101).eback(30.0, 0.05)
+    lines = _proton_lines("Ru", 101, 30.0, eback)
+    M = opt.molar_mass(paths.path, 44, 100)
+    row = opt.run_one(opt.RunSpec((44, 100, 0), 2, t, 30.0, eback, lines, molar_mass=M))
+    assert row["status"] == "ok" and row["m_EOI_g"] > 0
+    assert row["m_EOC_g"] >= row["m_EOI_g"] * (1 - 1e-6)
+    st = opt.run(lines, out=io.StringIO(), outdir=str(tmp_path))
+    key = opt.di_key(st, (44, 100, 0))
+    direct = float(st.N_0) * float(st.reaction_rate[key]) * M / float(opt.AVOGADRO)   # g/s
+    assert row["m_rate"] == pytest.approx(direct * 3600 / (float(st.Ibeam) * 1e3), rel=0.05)
