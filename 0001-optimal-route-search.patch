@@ -1,0 +1,709 @@
+From edf147782afccee77b68e3050b57e1e063d6d175 Mon Sep 17 00:00:00 2001
+From: Rome <romec558@mit.edu>
+Date: Mon, 2 Nov 2026 18:04:16 -0500
+Subject: [PATCH] Add optimal-route search script over target mass and beam
+ energy
+
+scripts/optimal_route.py runs isotopia_py for every library target with
+mass number A_DI..A_DI+5 on a linear energy grid and ranks routes by DI
+activity at end of cooling. Eback for charged particles follows from a
+fixed target thickness via the code's Bethe-Bloch stopping power. An
+exclusion file drops routes whose target or one-step decay precursor of
+the DI is listed. tests/test_optimal_route.py covers name parsing, the
+exclusion rules, the Eback solver (analytic S = k/E case) and a Mo-100
+run with the library.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015aPd9CgZ2xM3MLVgJP4691
+---
+ scripts/optimal_route.py    | 562 ++++++++++++++++++++++++++++++++++++
+ tests/test_optimal_route.py | 108 +++++++
+ 2 files changed, 670 insertions(+)
+ create mode 100644 scripts/optimal_route.py
+ create mode 100644 tests/test_optimal_route.py
+
+diff --git a/scripts/optimal_route.py b/scripts/optimal_route.py
+new file mode 100644
+index 0000000..a01a25e
+--- /dev/null
++++ b/scripts/optimal_route.py
+@@ -0,0 +1,562 @@
++"""Search for the optimal production route of a desired isotope (DI).
++
++For a DI with mass number A, the script runs isotopia_py for every candidate
++target with mass number A..A+5 and every beam energy on a linear grid, and
++ranks the (target, projectile, energy) routes by the DI activity at the end
++of cooling.
++
++    python scripts/optimal_route.py Tc99_m1 --projectile p --de 1 --thickness 0.05
++    python scripts/optimal_route.py Cu64 -p p d --de 0.5 --exclude blacklist.txt --jobs 4
++
++Outputs (in --out, default runs/optimal_route/<DI>):
++    scan.csv     one row per run (route, Ebeam, Eback, activities, status)
++    summary.txt  assumptions, best route per target, overall best, warnings
++
++How each projectile is treated
++    p, d, t, h, a  Ebeam scanned on the grid; Eback follows from a fixed target
++                   thickness (see `EbackSolver`).
++    g              Electron energy scanned, but ISOTOPIA only has bremsstrahlung
++                   spectra for integer 1-200 MeV, so the grid is reduced to
++                   distinct integer energies >= 1 MeV.
++    n              Reactor spectrum (files/neutron_spectra/n-hfr.dat) does not
++                   depend on Ebeam: one run per target, no energy scan.
++
++Exclusion list (--exclude FILE): one nuclide per line, '#' starts a comment.
++A route is excluded if its target, or a parent that feeds the DI by decay in
++the ISOTOPIA model (same A, Z-1 beta- or Z+1 beta+), is on the list.
++Names: Tc99 (any state), Tc99_g (ground), Tc99_m1 / Tc99_m2 (isomers).
++
++Needs ISOTOPIA_DIR (and ISOTOPIA_LIBS unless isotopia.libs sits next to it),
++exactly as for `isotopia_py.run`.
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import io
++import os
++import re
++import sys
++import tempfile
++from concurrent.futures import ProcessPoolExecutor
++from dataclasses import dataclass, field
++from pathlib import Path
++
++import numpy as np
++from scipy.integrate import cumulative_trapezoid
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT))
++
++from isotopia_py.constants import NUC, NUMTIME, PARSYM, PARZ, RHOTABLE, nuc  # noqa: E402
++from isotopia_py.inputdeck import machine  # noqa: E402
++from isotopia_py.rates import stoppingpower  # noqa: E402
++from isotopia_py.run import run  # noqa: E402
++from isotopia_py.state import IsotopiaError, State  # noqa: E402
++
++MASS_WINDOW = 5          # targets have mass number A_DI .. A_DI + MASS_WINDOW
++ZDEPTH_DEFAULT = 10      # ISOTOPIA default Zdepth (input.f90); limits which Z it computes
++STABLE_HALFLIFE = 1e17   # s; ISOTOPIA treats longer half-lives as stable (decaydata.f90)
++
++Nuclide = tuple[int, int, int | None]   # (Z, A, I); I = None means "any state"
++
++
++# ----------------------------------------------------------------------------
++# Nuclide names and lists
++# ----------------------------------------------------------------------------
++
++_NAME = re.compile(r"^([A-Z][a-z]?)(\d{1,3})(?:_(g|m1|m2))?$")
++_STATE = {None: None, "g": 0, "m1": 1, "m2": 2}
++
++
++def parse_nuclide(name: str) -> Nuclide:
++    """Parse 'Tc99', 'Tc99_g', 'Tc99_m1' into (Z, A, I); bare names give I = None."""
++    m = _NAME.match(name.strip())
++    if not m:
++        raise ValueError(f"cannot parse nuclide name '{name}' (expected e.g. Tc99, Tc99_g, Tc99_m1)")
++    symbol, mass, state = m.groups()
++    symbols = [s.strip() for s in NUC]
++    if symbol not in symbols:
++        raise ValueError(f"unknown element symbol '{symbol}' in '{name}'")
++    return symbols.index(symbol) + 1, int(mass), _STATE[state]
++
++
++def nuclide_name(Z: int, A: int, I: int | None) -> str:
++    """Display name in the project convention: Tc99, Tc99_g, Tc99_m1."""
++    suffix = {None: "", -1: "", 0: "_g", 1: "_m1", 2: "_m2"}[I]
++    return f"{nuc(Z).strip()}{A}{suffix}"
++
++
++def read_nuclide_list(path: str | os.PathLike) -> set[Nuclide]:
++    """Read a nuclide list file (exclusion now; the same format serves a warning list later).
++
++    One or more names per line separated by spaces or commas; '#' starts a comment.
++    """
++    entries: set[Nuclide] = set()
++    with open(path, encoding="utf-8") as fh:
++        for lineno, raw in enumerate(fh, 1):
++            for token in raw.split("#", 1)[0].replace(",", " ").split():
++                try:
++                    entries.add(parse_nuclide(token))
++                except ValueError as exc:
++                    raise ValueError(f"{path}, line {lineno}: {exc}") from None
++    return entries
++
++
++def listed(Z: int, A: int, is_: int, entries: set[Nuclide]) -> Nuclide | None:
++    """Return the list entry matching ISOTOPIA state (Z, A, is_), or None.
++
++    is_ = -1 is ISOTOPIA's 'total' (all states), so it matches any entry for Z, A.
++    A bare entry (I = None) matches every state.
++    """
++    for eZ, eA, eI in entries:
++        if eZ == Z and eA == A and (eI is None or is_ == -1 or eI == is_):
++            return (eZ, eA, eI)
++    return None
++
++
++# ----------------------------------------------------------------------------
++# Candidate targets
++# ----------------------------------------------------------------------------
++
++@dataclass(frozen=True)
++class Target:
++    Z: int
++    A: int
++    stable: bool
++
++    @property
++    def name(self) -> str:
++        return nuclide_name(self.Z, self.A, None)
++
++
++def natural_masses(path: str, Z: int) -> set[int]:
++    """Mass numbers with nonzero abundance in files/abundance/zZZZ (abundance.f90 format)."""
++    abfile = Path(path) / "files" / "abundance" / f"z{Z:03d}"
++    masses: set[int] = set()
++    if abfile.exists():
++        for line in abfile.read_text(encoding="utf-8", errors="replace").splitlines():
++            line = line.ljust(19)
++            if line[4:8].strip() and line[8:19].strip() and float(line[8:19]) > 0:
++                masses.add(int(line[4:8]))
++    return masses
++
++
++def candidate_targets(di: Nuclide, k0: int, path: str, crosspath: str,
++                      include_radioactive: bool, warnings: list[str]) -> list[Target]:
++    """Library targets with A_DI <= A <= A_DI + 5 whose ISOTOPIA Z window contains the DI.
++
++    ISOTOPIA computes residuals for Z from Zcomp + 1 down to Zcomp - Zdepth,
++    with Zcomp = Ztarget + Zprojectile and Zdepth = min(10, Ztarget - 1)
++    (reacinitial.f90, checkvalue.f90). Targets outside that window cannot
++    produce the DI in the code and are not run.
++    """
++    Zdi, Adi, _ = di
++    libdir = Path(crosspath) / PARSYM[k0]
++    if not libdir.is_dir():
++        raise SystemExit(f"cross-section library not found: {libdir}")
++    pattern = re.compile(r"^([A-Z][a-z]?)(\d{3})(m|n)?$")
++    symbols = [s.strip() for s in NUC]
++    targets = []
++    for entry in sorted(os.listdir(libdir)):
++        m = pattern.match(entry)
++        if not m or m.group(1) not in symbols:
++            continue
++        Z, A = symbols.index(m.group(1)) + 1, int(m.group(2))
++        if not Adi <= A <= Adi + MASS_WINDOW:
++            continue
++        if m.group(3):
++            warnings.append(f"{PARSYM[k0]}: isomeric target {entry} skipped "
++                            "(isotopia_py input deck cannot take isomeric targets)")
++            continue
++        Zcomp = Z + PARZ[k0]
++        if not Zcomp - min(ZDEPTH_DEFAULT, Z - 1) <= Zdi <= Zcomp + 1:
++            continue
++        stable = A in natural_masses(path, Z)
++        if not stable and not include_radioactive:
++            continue
++        targets.append(Target(Z, A, stable))
++    return targets
++
++
++# ----------------------------------------------------------------------------
++# Eback from target thickness (charged particles)
++# ----------------------------------------------------------------------------
++
++class EbackSolver:
++    """Exit energy of a charged beam after a fixed target thickness.
++
++    The beam loses energy as dE/dx = -S(E), with S the code's own Bethe-Bloch
++    stopping power (rates.stoppingpower, manual Sec. 4). The path length to
++    slow from Ebeam to Eback is
++
++        L(Ebeam, Eback) = integral_{Eback}^{Ebeam} dE / S(E)      [cm]
++
++    which is the same quantity ISOTOPIA reports as Leff. With the residual
++    range R(E) = integral_{E_floor}^{E} dE'/S(E'), the exit energy for a
++    thickness d is Eback = R^-1(R(Ebeam) - d).
++
++    The Bethe-Bloch formula is only valid above its maximum; below it the
++    formula falls to zero and then goes negative (unphysical). E_floor is
++    therefore set to the energy of the maximum of S(E). If the beam's range
++    is shorter than d, the beam stops in the target and Eback = E_floor.
++    """
++
++    def __init__(self, k0: int, Z: int, A: int, emax: float = 250.0, npts: int = 4000):
++        st = State()
++        st.k0, st.Ztarget, st.Atarget = k0, Z, A
++        st.rho_target = RHOTABLE[Z - 1]         # ISOTOPIA default density (reacinitial.f90)
++        # Locate the stopping-power maximum on a fine log grid, 1 keV to emax
++        E = np.geomspace(1e-3, emax, npts)
++        with np.errstate(all="ignore"):
++            Sp = np.array([float(stoppingpower(st, e)) for e in E])
++        self.E_floor = float(E[np.nanargmax(Sp)])
++        # Residual range R(E) above the floor (cumulative trapezoid of 1/S)
++        self.E = E[E >= self.E_floor]
++        self.R = cumulative_trapezoid(1.0 / Sp[E >= self.E_floor], self.E, initial=0.0)
++
++    def eback(self, ebeam: float, thickness: float) -> tuple[float, bool]:
++        """Exit energy (MeV) for beam energy `ebeam` (MeV) and `thickness` (cm).
++
++        Returns (Eback, stopped); stopped is True if the beam stops in the target.
++        """
++        r_back = np.interp(ebeam, self.E, self.R) - thickness
++        if r_back <= 0.0:
++            return self.E_floor, True
++        return float(np.interp(r_back, self.R, self.E)), False
++
++
++# ----------------------------------------------------------------------------
++# One ISOTOPIA run
++# ----------------------------------------------------------------------------
++
++@dataclass
++class RunSpec:
++    """Everything a worker needs for one run (picklable for multiprocessing)."""
++    di: Nuclide
++    k0: int
++    target: Target
++    ebeam: float | None          # MeV; None for neutrons
++    eback: float | None          # MeV; charged particles only
++    lines: list[str]
++    exclude: set[Nuclide] = field(default_factory=set)
++
++
++def di_key(st: State, di: Nuclide) -> tuple[int, int, int] | None:
++    """ISOTOPIA key for the DI. Ground state is stored as 'total' (-1) when
++    the library has no isomer for that Z, A. Returns None if the state is absent."""
++    Z, A, I = di
++    n_isomer = st.Nisomer[(Z, A)]
++    if I in (0, None) and n_isomer == -1:
++        return (Z, A, -1)
++    if I is not None and I > n_isomer:
++        return None
++    return (Z, A, -1 if I is None else I)
++
++
++def precursors(st: State, di: Nuclide) -> list[tuple[int, int, int]]:
++    """Parents that feed the DI by decay in the model (kinetics.equations, step 2):
++    same A, Z-1 with rtyp 1 (beta-) or Z+1 with rtyp 2 (beta+), produced in this run."""
++    Z, A, _ = di
++    found = []
++    for isob, rt in ((-1, 1), (1, 2)):
++        Zp = Z + isob
++        for is_p in range(-1, st.Nisomer[(Zp, A)] + 1):
++            pkey = (Zp, A, is_p)
++            if st.rtyp[pkey] == rt and float(st.reaction_rate[pkey]) > 0:
++                found.append(pkey)
++    return found
++
++
++def run_one(spec: RunSpec) -> dict:
++    """Run isotopia_py once and extract the DI activities; never raises."""
++    t = spec.target
++    row = {"projectile": PARSYM[spec.k0], "target": t.name, "stable": t.stable,
++           "Ebeam_MeV": spec.ebeam, "Eback_MeV": spec.eback, "Leff_cm": None,
++           "A_EOI_Bq": None, "A_EOC_Bq": None, "status": "ok", "note": ""}
++    try:
++        with tempfile.TemporaryDirectory() as tmp:
++            st = run(spec.lines, out=io.StringIO(), outdir=tmp)
++    except (IsotopiaError, OSError, ValueError) as exc:
++        row.update(status="error", note=" ".join(str(exc).split()))
++        return row
++    if spec.k0 > 1:
++        row["Leff_cm"] = float(st.Leff)
++
++    # Exclusion: precursors that feed the DI in this run
++    for pkey in precursors(st, spec.di):
++        hit = listed(*pkey, spec.exclude)
++        if hit:
++            row.update(status="excluded", note=f"precursor {nuclide_name(*hit)} on exclusion list")
++            return row
++
++    key = di_key(st, spec.di)
++    if key is None:
++        row.update(status="not_produced",
++                   note="no positive DI cross section between Eback and Ebeam for this target")
++        return row
++    if float(st.Thalf[key]) >= STABLE_HALFLIFE:
++        row.update(status="no_data", note=f"no half-life for DI in files/decay/z{key[0]:03d} "
++                                          "(treated as stable, activity = 0)")
++        return row
++    # End of cooling is the last time point; with Tcool = 0 there is no cooling grid
++    i_eoc = NUMTIME if st.Tco > 0 else st.Ntime
++    row["A_EOI_Bq"] = float(st.activity[key][st.Ntime])
++    row["A_EOC_Bq"] = float(st.activity[key][i_eoc])
++    return row
++
++
++# ----------------------------------------------------------------------------
++# Building the scan
++# ----------------------------------------------------------------------------
++
++def energy_grid(emin: float, emax: float, de: float) -> np.ndarray:
++    """Linear grid emin, emin + de, ... <= emax (MeV)."""
++    n = int(np.floor((emax - emin) / de + 1e-9))
++    return emin + de * np.arange(n + 1)
++
++
++def base_lines(t: Target, k0: int, args) -> list[str]:
++    """ISOTOPIA input keywords shared by every run on this target (manual Sec. 6)."""
++    lines = [f"projectile {PARSYM[k0]}", f"element {nuc(t.Z).strip()}", f"mass {t.A}",
++             f"Ibeam {args.ibeam}", f"Tirrad {args.tirrad}", f"Tcool {args.tcool}"]
++    if k0 <= 1:
++        lines.append(f"thickness {args.thickness}")
++    if k0 == 1 and args.flux is not None:
++        lines.append(f"fluxtotal {args.flux}")
++    return lines
++
++
++def build_specs(di: Nuclide, k0: int, targets: list[Target], grid: np.ndarray,
++                args, exclude: set[Nuclide], warnings: list[str]) -> tuple[list[RunSpec], list[dict]]:
++    """All runs for one projectile, plus pre-filled rows for routes skipped before running."""
++    specs, skipped = [], []
++    p = PARSYM[k0]
++    for t in targets:
++        hit = listed(t.Z, t.A, 0, exclude)
++        if hit:
++            skipped.append({"projectile": p, "target": t.name, "stable": t.stable,
++                            "status": "excluded", "note": f"target {nuclide_name(*hit)} on exclusion list"})
++            continue
++        lines = base_lines(t, k0, args)
++        if k0 == 1:                                   # neutrons: spectrum independent of Ebeam
++            specs.append(RunSpec(di, k0, t, None, None, lines, exclude))
++        elif k0 == 0:                                 # photons: integer spectra 1..200 MeV
++            for e in sorted({int(e) for e in grid if e >= 1.0}):
++                specs.append(RunSpec(di, k0, t, float(e), None, lines + [f"Ebeam {e}."], exclude))
++        else:                                         # charged particles: Eback from thickness
++            solver = EbackSolver(k0, t.Z, t.A)
++            n_low = n_stop = 0
++            for e in grid:
++                if e <= solver.E_floor:
++                    n_low += 1
++                    continue
++                eback, stopped = solver.eback(float(e), args.thickness)
++                n_stop += stopped
++                if eback >= e:
++                    continue
++                specs.append(RunSpec(di, k0, t, float(e), eback,
++                                     lines + [f"Ebeam {e:.6f}", f"Eback {eback:.6f}"], exclude))
++            if n_low:
++                warnings.append(f"{p}+{t.name}: {n_low} energies <= {solver.E_floor:.3f} MeV skipped "
++                                "(below the Bethe-Bloch maximum; stopping power invalid)")
++            if n_stop:
++                warnings.append(f"{p}+{t.name}: beam stops in the {args.thickness} cm target at "
++                                f"{n_stop} energies; Eback clipped to {solver.E_floor:.3f} MeV")
++    if k0 == 1:
++        warnings.append("n: reactor spectrum does not depend on Ebeam; one run per target, no energy scan")
++    if k0 == 0:
++        warnings.append("g: bremsstrahlung spectra exist only for integer 1-200 MeV; "
++                        "grid reduced to distinct integer energies >= 1 MeV")
++    return specs, skipped
++
++
++def library_emin(crosspath: str, k0: int, t: Target) -> float | None:
++    """Lowest energy in the target's non-elastic file (MT005, or MT003 for neutrons), MeV."""
++    mt = "MT003" if k0 == 1 else "MT005"
++    nucname = f"{nuc(t.Z).strip()}{t.A:03d}"
++    f = Path(crosspath) / PARSYM[k0] / nucname / "iaea.2026" / "tables" / "xs" / \
++        f"{PARSYM[k0]}-{nucname}-{mt}.iaea.2026"
++    if not f.exists():
++        return None
++    for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
++        if line.strip() and not line.startswith("#"):
++            return float(line.split()[0])
++    return None
++
++
++# ----------------------------------------------------------------------------
++# Output
++# ----------------------------------------------------------------------------
++
++CSV_FIELDS = ["projectile", "target", "stable", "Ebeam_MeV", "Eback_MeV", "Leff_cm",
++              "A_EOI_Bq", "A_EOC_Bq", "status", "note"]
++
++ASSUMPTIONS = """\
++Assumptions and limitations
++- Figure of merit: DI activity at end of cooling (Bq), last point of ISOTOPIA's time grid.
++- Targets: mass number A_DI..A_DI+5, ground state, with a cross-section library;
++  only Z inside ISOTOPIA's residual window (Zcomp+1 .. Zcomp-Zdepth, Zdepth = 10).
++- Charged particles: Eback from a fixed thickness using ISOTOPIA's Bethe-Bloch
++  stopping power and default density; Leff_cm is the path length ISOTOPIA itself
++  computed (100-bin midpoint rule) and may differ slightly from the thickness.
++- Decay physics is the Phase 1 port of equations.f90, including its known defects
++  (claude/equations_f90_findings.md): beta- parents do NOT feed daughters during
++  cooling, no branching ratios, double-counted parent feeding, no isomeric
++  transition. End-of-cooling activities of DIs fed by beta- decay are therefore
++  underestimated; compare A_EOI_Bq where this matters.
++- Exclusion checks the target and the one-step decay precursors ISOTOPIA models;
++  longer chains are not tracked by the code.
++- Radiotoxicity and processing time are not part of the ranking yet.
++"""
++
++
++def _fmt(v) -> str:
++    if v is None:
++        return ""
++    if isinstance(v, float):
++        return f"{v:.6e}" if abs(v) >= 1e4 or (v != 0 and abs(v) < 1e-2) else f"{v:.6f}"
++    return str(v)
++
++
++def write_outputs(outdir: Path, di_name: str, rows: list[dict], warnings: list[str], args) -> str:
++    """Write scan.csv and summary.txt; return the summary text."""
++    outdir.mkdir(parents=True, exist_ok=True)
++    with open(outdir / "scan.csv", "w", newline="", encoding="utf-8") as fh:
++        w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
++        w.writeheader()
++        for r in rows:
++            w.writerow({k: _fmt(r.get(k)) for k in CSV_FIELDS})
++
++    ok = [r for r in rows if r["status"] == "ok" and r["A_EOC_Bq"] is not None]
++    settings = (f"Projectiles: {' '.join(args.projectile)}   grid: {args.emin}-{args.emax} MeV, "
++                f"step {args.de} MeV   thickness: {args.thickness} cm")
++    beam = (f"Ibeam: {args.ibeam} mA   Tirrad: {args.tirrad}   Tcool: {args.tcool}   "
++            f"exclusion list: {args.exclude or 'none'}")
++    out = [f"Optimal route search for {di_name}", "", settings, beam, "", ASSUMPTIONS]
++
++    # Best energy per (projectile, target), sorted by activity
++    best: dict[tuple[str, str], dict] = {}
++    for r in ok:
++        k = (r["projectile"], r["target"])
++        if k not in best or r["A_EOC_Bq"] > best[k]["A_EOC_Bq"]:
++            best[k] = r
++    ranked = sorted(best.values(), key=lambda r: r["A_EOC_Bq"], reverse=True)
++    out.append("Best energy per route (ranked by DI activity at end of cooling)")
++    out.append(f"{'proj':>4} {'target':>8} {'stable':>6} {'Ebeam':>9} {'Eback':>9} "
++               f"{'A_EOI [Bq]':>12} {'A_EOC [Bq]':>12}")
++    for r in ranked:
++        out.append(f"{r['projectile']:>4} {r['target']:>8} {'yes' if r['stable'] else 'no':>6} "
++                   f"{_fmt(r['Ebeam_MeV']):>9} {_fmt(r['Eback_MeV']):>9} "
++                   f"{r['A_EOI_Bq']:12.4e} {r['A_EOC_Bq']:12.4e}")
++    out.append("")
++    if ranked and ranked[0]["A_EOC_Bq"] > 0:
++        r = ranked[0]
++        e = "reactor spectrum" if r["Ebeam_MeV"] is None else f"Ebeam = {r['Ebeam_MeV']:.4g} MeV"
++        out.append(f"OPTIMAL: {r['target']}({r['projectile']},x){di_name}, {e}, "
++                   f"A_EOC = {r['A_EOC_Bq']:.4e} Bq")
++    else:
++        out.append("OPTIMAL: none - no route produced the DI with nonzero activity")
++    out.append("")
++
++    # Counts of non-ok runs, then warnings
++    for status in ("excluded", "not_produced", "no_data", "error"):
++        n = sum(r["status"] == status for r in rows)
++        if n:
++            out.append(f"{n} runs with status '{status}' (see scan.csv)")
++    never = sorted({(r["projectile"], r["target"]) for r in rows} - set(best))
++    if never:
++        out.append("Routes with no usable result at any energy: "
++                   + ", ".join(f"{t}({p},x)" for p, t in never))
++    out.append("")
++    out.append("Warnings")
++    if warnings:
++        out.extend(f"- {w}" for w in warnings)
++    else:
++        out.append("- none")
++    text = "\n".join(out) + "\n"
++    (outdir / "summary.txt").write_text(text, encoding="utf-8")
++    return text
++
++
++# ----------------------------------------------------------------------------
++# Main
++# ----------------------------------------------------------------------------
++
++def parse_args(argv=None):
++    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
++    ap.add_argument("di", help="desired isotope, e.g. Tc99_m1, Cu64, Tc99_g")
++    ap.add_argument("-p", "--projectile", nargs="+", required=True, choices=PARSYM,
++                    help="projectile(s): g n p d t h a")
++    ap.add_argument("--emin", type=float, default=0.001, help="lowest beam energy [MeV] (default 0.001)")
++    ap.add_argument("--emax", type=float, default=200.0, help="highest beam energy [MeV] (default 200)")
++    ap.add_argument("--de", type=float, required=True, help="energy step [MeV]")
++    ap.add_argument("--thickness", type=float, default=0.05,
++                    help="target thickness [cm] (default 0.05, the ISOTOPIA default)")
++    ap.add_argument("--ibeam", type=float, default=1.0, help="beam current [mA] (default 1)")
++    ap.add_argument("--tirrad", default="1 d", help="irradiation time, ISOTOPIA syntax (default '1 d')")
++    ap.add_argument("--tcool", default="1 d", help="cooling time, ISOTOPIA syntax (default '1 d')")
++    ap.add_argument("--flux", type=float, default=None, help="neutron flux [cm^-2 s^-1] (n only)")
++    ap.add_argument("--exclude", default=None, help="text file of nuclides that exclude a route")
++    ap.add_argument("--include-radioactive", action="store_true",
++                    help="also use non-naturally-occurring (radioactive) targets")
++    ap.add_argument("--jobs", type=int, default=1, help="parallel worker processes (default 1)")
++    ap.add_argument("--out", default=None, help="output directory (default runs/optimal_route/<DI>)")
++    args = ap.parse_args(argv)
++    if not 0 < args.emin < args.emax <= 200.0:
++        ap.error("need 0 < emin < emax <= 200 MeV (library upper limit)")
++    if args.de <= 0 or args.thickness <= 0:
++        ap.error("--de and --thickness must be positive")
++    return args
++
++
++def main(argv=None) -> int:
++    args = parse_args(argv)
++    di = parse_nuclide(args.di)
++    if di[2] is None:
++        di = (di[0], di[1], 0)                 # bare DI name means the ground state
++    di_name = nuclide_name(*di)
++    exclude = read_nuclide_list(args.exclude) if args.exclude else set()
++    warnings: list[str] = []
++    if listed(*di, exclude):
++        warnings.append(f"the DI {di_name} itself is on the exclusion list")
++
++    paths = State()
++    machine(paths)                             # resolves ISOTOPIA_DIR / ISOTOPIA_LIBS
++    grid = energy_grid(args.emin, args.emax, args.de)
++    specs: list[RunSpec] = []
++    rows: list[dict] = []
++    for p in dict.fromkeys(args.projectile):
++        k0 = PARSYM.index(p)
++        targets = candidate_targets(di, k0, paths.path, paths.crosspath,
++                                    args.include_radioactive, warnings)
++        if not targets:
++            warnings.append(f"{p}: no candidate targets with A = {di[1]}..{di[1] + MASS_WINDOW} "
++                            f"in {paths.crosspath}{p}/")
++        for t in targets:
++            emin_lib = library_emin(paths.crosspath, k0, t)
++            if emin_lib is not None and k0 != 1 and args.emin < emin_lib:
++                warnings.append(f"{p}+{t.name}: library cross sections start at {emin_lib:g} MeV; "
++                                "lower beam energies give zero reaction rates")
++        s, skipped = build_specs(di, k0, targets, grid, args, exclude, warnings)
++        specs += s
++        rows += skipped
++
++    print(f"{di_name}: {len(specs)} runs on {len({(s.k0, s.target) for s in specs})} routes", file=sys.stderr)
++    if args.jobs > 1:
++        with ProcessPoolExecutor(args.jobs) as pool:
++            rows += list(pool.map(run_one, specs, chunksize=8))
++    else:
++        rows += [run_one(s) for s in specs]
++    for r in rows:
++        if r["status"] == "error":
++            warnings.append(f"{r['projectile']}+{r['target']} at {r.get('Ebeam_MeV')} MeV: {r['note']}")
++
++    outdir = Path(args.out) if args.out else ROOT / "runs" / "optimal_route" / di_name
++    print(write_outputs(outdir, di_name, rows, warnings, args))
++    print(f"results in {outdir}", file=sys.stderr)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_optimal_route.py b/tests/test_optimal_route.py
+new file mode 100644
+index 0000000..66579b3
+--- /dev/null
++++ b/tests/test_optimal_route.py
+@@ -0,0 +1,108 @@
++"""Tests for scripts/optimal_route.py.
++
++The first group needs no data. The last test needs ISOTOPIA_DIR and the proton
++library for Mo-100 (skipped otherwise).
++"""
++from __future__ import annotations
++
++import importlib.util
++import os
++import sys
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++ROOT = Path(__file__).resolve().parents[1]
++_spec = importlib.util.spec_from_file_location("optimal_route", ROOT / "scripts" / "optimal_route.py")
++opt = importlib.util.module_from_spec(_spec)
++sys.modules["optimal_route"] = opt          # dataclasses need the module registered
++_spec.loader.exec_module(opt)
++
++
++# ---------------------------------------------------------------- names and lists
++
++def test_parse_and_display_names():
++    assert opt.parse_nuclide("Tc99_m1") == (43, 99, 1)
++    assert opt.parse_nuclide("Tc99_g") == (43, 99, 0)
++    assert opt.parse_nuclide("Tc99") == (43, 99, None)
++    assert opt.nuclide_name(43, 99, 1) == "Tc99_m1"
++    assert opt.nuclide_name(43, 99, None) == "Tc99"
++    for bad in ("tc99", "Tc099m", "Xx99", "Tc99_m3"):
++        with pytest.raises(ValueError):
++            opt.parse_nuclide(bad)
++
++
++def test_read_nuclide_list(tmp_path):
++    f = tmp_path / "exclude.txt"
++    f.write_text("# blacklist\nMo99   # comment\nTc99_m1, Ru99_g\n\n")
++    assert opt.read_nuclide_list(f) == {(42, 99, None), (43, 99, 1), (44, 99, 0)}
++    f.write_text("Mo99\nnot_a_nuclide\n")
++    with pytest.raises(ValueError, match="line 2"):
++        opt.read_nuclide_list(f)
++
++
++def test_listed_matching_rules():
++    entries = {(42, 99, None), (43, 99, 1)}
++    assert opt.listed(42, 99, 0, entries)            # bare entry matches every state
++    assert opt.listed(42, 99, 1, entries)
++    assert opt.listed(43, 99, 1, entries)
++    assert not opt.listed(43, 99, 0, entries)        # Tc99_m1 does not match the ground state
++    assert opt.listed(43, 99, -1, entries)           # ISOTOPIA 'total' matches any listed state
++    assert not opt.listed(44, 99, -1, entries)
++
++
++def test_energy_grid():
++    g = opt.energy_grid(0.001, 200.0, 1.0)
++    assert g[0] == pytest.approx(0.001) and g[-1] == pytest.approx(199.001) and len(g) == 200
++    assert opt.energy_grid(1.0, 3.0, 0.5).tolist() == [1.0, 1.5, 2.0, 2.5, 3.0]
++
++
++# ---------------------------------------------------------------- Eback solver
++
++def test_eback_analytic(monkeypatch):
++    """With S(E) = k/E the range integral is (Ebeam^2 - Eback^2) / (2k), so
++    Eback = sqrt(Ebeam^2 - 2 k d) exactly."""
++    k = 200.0                                         # MeV^2 / cm
++    monkeypatch.setattr(opt, "stoppingpower", lambda st, E: np.float32(k / E))
++    solver = opt.EbackSolver(2, 42, 100, npts=20000)
++    for ebeam, d in ((20.0, 0.05), (50.0, 1.0), (100.0, 5.0)):
++        eback, stopped = solver.eback(ebeam, d)
++        assert not stopped
++        assert eback == pytest.approx(np.sqrt(ebeam**2 - 2 * k * d), rel=1e-4)
++    # Range shorter than the target: beam stops, Eback clipped to the floor
++    eback, stopped = solver.eback(5.0, 10.0)
++    assert stopped and eback == solver.E_floor
++
++
++def test_eback_floor_is_stopping_power_maximum():
++    """The real Bethe-Bloch floor for protons on Mo sits near 0.5 MeV and S > 0 above it."""
++    solver = opt.EbackSolver(2, 42, 100)
++    assert 0.1 < solver.E_floor < 1.0
++    assert np.all(np.diff(solver.R) > 0)              # range increases monotonically
++
++
++# ---------------------------------------------------------------- with the library
++
++ISOTOPIA = Path(os.environ.get("ISOTOPIA_DIR") or ROOT.parent / "isotopia")
++needs_lib = pytest.mark.skipif(not (ISOTOPIA / "files").is_dir(), reason="ISOTOPIA_DIR not set")
++
++
++@needs_lib
++def test_mo100_route_and_precursor_exclusion():
++    """p + Mo-100 at 20 MeV makes Tc-99m; Mo-99 feeds it by beta- decay in the
++    model, so listing Mo99 must exclude the route. ISOTOPIA's own Leff must match
++    the requested thickness."""
++    st_paths = opt.State()
++    opt.machine(st_paths)
++    t = opt.Target(42, 100, True)
++    solver = opt.EbackSolver(2, 42, 100)
++    eback, _ = solver.eback(20.0, 0.05)
++    lines = ["projectile p", "element Mo", "mass 100", "Ibeam 1", "Tirrad 1 d", "Tcool 1 d",
++             "Ebeam 20.0", f"Eback {eback:.6f}"]
++    di = (43, 99, 1)
++    row = opt.run_one(opt.RunSpec(di, 2, t, 20.0, eback, lines))
++    assert row["status"] == "ok" and row["A_EOC_Bq"] > 0
++    assert row["Leff_cm"] == pytest.approx(0.05, rel=1e-3)
++    row = opt.run_one(opt.RunSpec(di, 2, t, 20.0, eback, lines, {(42, 99, None)}))
++    assert row["status"] == "excluded" and "Mo99" in row["note"]
+-- 
+2.43.0
+
