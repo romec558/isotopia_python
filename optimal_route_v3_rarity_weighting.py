@@ -1,0 +1,877 @@
+"""Search for the optimal production route of a desired isotope (DI).
+
+For a DI with mass number A, the script runs isotopia_py for every candidate
+target with mass number A-5..A+5 and every beam energy on a linear grid. Each
+route reports the mass of the DI produced (g) at end of irradiation and at end
+of cooling, and the initial mass production rate; routes are ranked by the
+--metric chosen (default: mass at end of cooling). Stable and radioactive DIs
+are handled the same way, because the masses come from ISOTOPIA's atom counts.
+
+    python scripts/optimal_route.py Tc99_m1 --projectile p --de 1 --thickness 0.05
+    python scripts/optimal_route.py Cu64 -p p d --de 0.5 --exclude blacklist.txt --jobs 4
+
+Outputs (in --out, default runs/optimal_route/<DI>):
+    scan.csv     one row per run (route, Ebeam, Eback, masses, status)
+    summary.txt  assumptions, best route per target, overall best, warnings
+
+How each projectile is treated
+    p, d, t, h, a  Ebeam scanned on the grid; Eback follows from a fixed target
+                   thickness (see `EbackSolver`).
+    g              Electron energy scanned, but ISOTOPIA only has bremsstrahlung
+                   spectra for integer 1-200 MeV, so the grid is reduced to
+                   distinct integer energies >= 1 MeV.
+    n              Reactor spectrum (files/neutron_spectra/n-hfr.dat) does not
+                   depend on Ebeam: one run per target, no energy scan.
+
+Exclusion list (--exclude FILE): one nuclide per line, '#' starts a comment.
+A route is excluded if its target, or a parent that feeds the DI by decay in
+the ISOTOPIA model (same A, Z-1 beta- or Z+1 beta+), is on the list.
+Names: Tc99 (any state), Tc99_g (ground), Tc99_m1 / Tc99_m2 (isomers).
+
+Rarity weighting (--rarity WORKBOOK): each route's score is its mass metric times
+(1 + Delta)/2, with Delta = rarity(DI) - rarity(target) from the team's price /
+obtainability workbook (see `RarityIndex`). Routes whose target is rarer than the
+DI are kept but scored lower and flagged. --exclude is applied independently.
+
+Needs ISOTOPIA_DIR (and ISOTOPIA_LIBS unless isotopia.libs sits next to it),
+exactly as for `isotopia_py.run`.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import os
+import re
+import sys
+import tempfile
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+from scipy.integrate import cumulative_trapezoid
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from isotopia_py.constants import AVOGADRO, NUC, NUMTIME, PARA, PARMASS, PARSYM, PARZ, RHOTABLE, nuc  # noqa: E402
+from isotopia_py.fortran import endf_float  # noqa: E402
+from isotopia_py.inputdeck import machine  # noqa: E402
+from isotopia_py.rates import stoppingpower  # noqa: E402
+from isotopia_py.run import run  # noqa: E402
+from isotopia_py.state import IsotopiaError, State  # noqa: E402
+
+MASS_WINDOW = 5          # targets have mass number A_DI - MASS_WINDOW .. A_DI + MASS_WINDOW
+ZDEPTH_DEFAULT = 10      # ISOTOPIA default Zdepth (input.f90); limits which Z it computes
+ADEPTH_DEFAULT = 20      # ISOTOPIA default Adepth (input.f90); limits which A it computes
+NEUTRON_MASS_U = PARMASS[1]   # u; neutron mass from isotopia_py.constants (constants.f90)
+
+Nuclide = tuple[int, int, int | None]   # (Z, A, I); I = None means "any state"
+
+
+# ----------------------------------------------------------------------------
+# Nuclide names and lists
+# ----------------------------------------------------------------------------
+
+_NAME = re.compile(r"^([A-Z][a-z]?)(\d{1,3})(?:_(g|m1|m2))?$")
+_STATE = {None: None, "g": 0, "m1": 1, "m2": 2}
+
+
+def parse_nuclide(name: str) -> Nuclide:
+    """Parse 'Tc99', 'Tc99_g', 'Tc99_m1' into (Z, A, I); bare names give I = None."""
+    m = _NAME.match(name.strip())
+    if not m:
+        raise ValueError(f"cannot parse nuclide name '{name}' (expected e.g. Tc99, Tc99_g, Tc99_m1)")
+    symbol, mass, state = m.groups()
+    symbols = [s.strip() for s in NUC]
+    if symbol not in symbols:
+        raise ValueError(f"unknown element symbol '{symbol}' in '{name}'")
+    return symbols.index(symbol) + 1, int(mass), _STATE[state]
+
+
+def nuclide_name(Z: int, A: int, I: int | None) -> str:
+    """Display name in the project convention: Tc99, Tc99_g, Tc99_m1."""
+    suffix = {None: "", -1: "", 0: "_g", 1: "_m1", 2: "_m2"}[I]
+    return f"{nuc(Z).strip()}{A}{suffix}"
+
+
+def read_nuclide_list(path: str | os.PathLike) -> set[Nuclide]:
+    """Read a nuclide list file (exclusion now; the same format serves a warning list later).
+
+    One or more names per line separated by spaces or commas; '#' starts a comment.
+    """
+    entries: set[Nuclide] = set()
+    with open(path, encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            for token in raw.split("#", 1)[0].replace(",", " ").split():
+                try:
+                    entries.add(parse_nuclide(token))
+                except ValueError as exc:
+                    raise ValueError(f"{path}, line {lineno}: {exc}") from None
+    return entries
+
+
+def listed(Z: int, A: int, is_: int, entries: set[Nuclide]) -> Nuclide | None:
+    """Return the list entry matching ISOTOPIA state (Z, A, is_), or None.
+
+    is_ = -1 is ISOTOPIA's 'total' (all states), so it matches any entry for Z, A.
+    A bare entry (I = None) matches every state.
+    """
+    for eZ, eA, eI in entries:
+        if eZ == Z and eA == A and (eI is None or is_ == -1 or eI == is_):
+            return (eZ, eA, eI)
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Candidate targets
+# ----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Target:
+    Z: int
+    A: int
+    stable: bool
+
+    @property
+    def name(self) -> str:
+        return nuclide_name(self.Z, self.A, None)
+
+
+def natural_masses(path: str, Z: int) -> set[int]:
+    """Mass numbers with nonzero abundance in files/abundance/zZZZ (abundance.f90 format)."""
+    abfile = Path(path) / "files" / "abundance" / f"z{Z:03d}"
+    masses: set[int] = set()
+    if abfile.exists():
+        for line in abfile.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.ljust(19)
+            if line[4:8].strip() and line[8:19].strip() and float(line[8:19]) > 0:
+                masses.add(int(line[4:8]))
+    return masses
+
+
+def candidate_targets(di: Nuclide, k0: int, path: str, crosspath: str,
+                      include_radioactive: bool, warnings: list[str]) -> list[Target]:
+    """Library targets with A_DI - 5 <= A <= A_DI + 5 whose ISOTOPIA window contains the DI.
+
+    ISOTOPIA computes residuals for Z from Zcomp + 1 down to Zcomp - Zdepth and
+    for A from Acomp down to Acomp - Adepth, with Zcomp = Ztarget + Zprojectile,
+    Acomp = Atarget + Aprojectile, Zdepth = min(10, Ztarget - 1) and
+    Adepth = min(20, Atarget - 1) (reacinitial.f90, checkvalue.f90).
+
+    A reaction can raise the mass number by at most Aprojectile (capture of
+    the whole projectile), so a lighter target can only reach the DI if
+    Atarget + Aprojectile >= A_DI. Targets that fail either window cannot
+    produce the DI in the code; they are not run, and lighter targets
+    dropped this way are reported in `warnings`.
+    """
+    Zdi, Adi, _ = di
+    libdir = Path(crosspath) / PARSYM[k0]
+    if not libdir.is_dir():
+        raise SystemExit(f"cross-section library not found: {libdir}")
+    pattern = re.compile(r"^([A-Z][a-z]?)(\d{3})(m|n)?$")
+    symbols = [s.strip() for s in NUC]
+    targets = []
+    too_light: list[str] = []
+    for entry in sorted(os.listdir(libdir)):
+        m = pattern.match(entry)
+        if not m or m.group(1) not in symbols:
+            continue
+        Z, A = symbols.index(m.group(1)) + 1, int(m.group(2))
+        if abs(A - Adi) > MASS_WINDOW:
+            continue
+        if m.group(3):
+            warnings.append(f"{PARSYM[k0]}: isomeric target {entry} skipped "
+                            "(isotopia_py input deck cannot take isomeric targets)")
+            continue
+        if (Z, A) == (Zdi, Adi) and di[2] in (0, None):
+            # The DI's own ground state as target: ISOTOPIA's inventory for it is the
+            # unreacted target (it only depletes), not production. An isomeric DI from
+            # its own ground state (e.g. Tc-99 -> Tc-99m by inelastic scattering) is kept.
+            warnings.append(f"{PARSYM[k0]}: target {entry} skipped (it is the DI itself)")
+            continue
+        Zcomp, Acomp = Z + PARZ[k0], A + PARA[k0]
+        if not Zcomp - min(ZDEPTH_DEFAULT, Z - 1) <= Zdi <= Zcomp + 1:
+            continue
+        if not Acomp - min(ADEPTH_DEFAULT, A - 1) <= Adi <= Acomp:
+            if Adi > Acomp:
+                too_light.append(entry)
+            continue
+        stable = A in natural_masses(path, Z)
+        if not stable and not include_radioactive:
+            continue
+        targets.append(Target(Z, A, stable))
+    if too_light:
+        warnings.append(f"{PARSYM[k0]}: {len(too_light)} lighter targets skipped, A + {PARA[k0]} < "
+                        f"{Adi} so they cannot reach the DI mass: {', '.join(too_light)}")
+    return targets
+
+
+# ----------------------------------------------------------------------------
+# Atomic mass of the DI (for atoms -> grams)
+# ----------------------------------------------------------------------------
+
+def molar_mass(path: str, Z: int, A: int) -> float:
+    """Molar mass of nuclide (Z, A) in g/mol, from ISOTOPIA's decay library.
+
+    Every nuclide in files/decay/zZZZ (JEFF-3.1.1, ENDF-6 format), stable ones
+    included, starts with an MF1/MT451 record whose first line holds ZA and
+    AWR, the atomic mass in units of the neutron mass (ENDF-6 manual, Sec. 1.1).
+    The atomic mass is AWR * m_n, and in g/mol it equals the mass in u.
+
+    Raises
+    ------
+    LookupError
+        If the file or the nuclide's record is missing (data must come from
+        the library, so the search stops and reports it).
+    """
+    decayfile = Path(path) / "files" / "decay" / f"z{Z:03d}"
+    if not decayfile.exists():
+        raise LookupError(f"decay file {decayfile} not found")
+    za = 1000 * Z + A
+    with open(decayfile, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            # First line of an MF1/MT451 section: ZA in columns 1-11, AWR in 12-22
+            if line[71:80] == "1451    1" and round(endf_float(line[0:11])) == za:
+                return endf_float(line[11:22]) * NEUTRON_MASS_U
+    raise LookupError(f"no record (AWR) for {nuclide_name(Z, A, None)} in {decayfile}")
+
+
+# ----------------------------------------------------------------------------
+# Rarity index (team workbook Element_Prices_per_Gram_USD.xlsx)
+# ----------------------------------------------------------------------------
+
+RARITY_BASES = ("price", "obtainability")
+_ISOTOPE_IN_TEXT = re.compile(r"-(\d{1,3})(m)?(?![\d%])")   # "Technetium-99m", "93% U-235"
+
+
+def _num(v) -> float:
+    """Excel N(): numbers pass through, anything else (blank, text) is 0."""
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+
+
+def _isotope_from_text(text: str) -> tuple[int, int] | None:
+    """(A, I) named in a workbook label, e.g. 'Technetium-99m' -> (99, 1); None if absent."""
+    if "deuterium" in text.lower():
+        return 2, 0
+    m = _ISOTOPE_IN_TEXT.search(text)
+    return (int(m.group(1)), 1 if m.group(2) else 0) if m else None
+
+
+class RarityIndex:
+    """Rarity index in [0, 1] (0 = least rare) per nuclide, read from the team workbook.
+
+    The workbook stores formulas without cached values, so they are evaluated here
+    from the raw columns, exactly as written in the sheet:
+
+    price          'Price per gram' column I: (ln F - ln F_min) / (ln F_max - ln F_min),
+                   F = average market price (USD/g); min and max over every row with
+                   F > 0, isotope rows included.
+    obtainability  'US supply ranking' column E: H/100 * (W + (1 - W) * K/100), with
+                   H = import reliance used (%), K = China + Russia share (%), taken as
+                   min(100, China + Russia), or the sheet's assumed share when both are
+                   blank; W and the assumed share come from cells E3 and E4. Only rows
+                   7-85 are ranked (the sheet's own lookup range).
+
+    Lookup order, following the team's 'Rarity Index Structure' diagram, with every
+    fallback recorded as a flag: isotope-specific price row if one exists, else the
+    element row; if the chosen basis has no value, the other basis; if neither, 0.
+    Obtainability is defined per element in the workbook, so it never has an
+    isotope-level value and that is not flagged.
+    """
+
+    def __init__(self, path: str | os.PathLike):
+        try:
+            import openpyxl  # optional: only needed when --rarity is used
+        except ImportError:
+            raise SystemExit("--rarity needs openpyxl (pip install openpyxl)") from None
+        wb = openpyxl.load_workbook(path, data_only=False, read_only=True)
+
+        # Price sheet: columns located by header text, not position
+        rows = list(wb["Price per gram"].iter_rows(values_only=True))
+        h = {str(name).strip(): k for k, name in enumerate(rows[0]) if name}
+        cz, crow, cform = h["Z"], h["Row type"], h["Form / isotope priced"]
+        cprice, cregion = h["Average market price (USD per gram)"], h["Market / region of price"]
+        self.element_price: dict[int, tuple[float, str]] = {}
+        self.isotope_price: dict[tuple[int, int, int], tuple[float, str]] = {}
+        positive = []
+        for r in rows[1:]:
+            if not isinstance(r[cz], int) or _num(r[cprice]) <= 0:
+                continue
+            Z, price, region = r[cz], _num(r[cprice]), str(r[cregion])
+            positive.append(price)
+            kind = str(r[crow])
+            if kind.startswith("Element"):
+                self.element_price.setdefault(Z, (price, region))
+                if "main isotope" in kind:       # e.g. 'Element — main isotope (Pu-239)'
+                    iso = _isotope_from_text(kind)
+                    if iso:
+                        self.isotope_price[(Z, *iso)] = (price, region)
+            elif kind.startswith("Isotope variant"):
+                iso = _isotope_from_text(str(r[cform])) or _isotope_from_text(kind)
+                if iso:
+                    self.isotope_price[(Z, *iso)] = (price, region)
+        self._ln_min, self._ln_max = np.log(min(positive)), np.log(max(positive))
+
+        # Obtainability sheet: settings in E3/E4, header on row 6, ranked rows 7-85
+        ws = wb["US supply ranking"]
+        cells = list(ws.iter_rows(min_row=1, max_row=85, values_only=True))
+        W, assumed = _num(cells[2][4]), _num(cells[3][4])
+        hdr = {str(name).strip(): k for k, name in enumerate(cells[5]) if name}
+        ch = hdr["Import reliance used (%)"]
+        cchina, crussia = hdr["China share of imports (%)"], hdr["Russia share of imports (%)"]
+        self.obtainability: dict[int, float] = {}
+        for r in cells[6:85]:
+            if not isinstance(r[1], int) or not isinstance(r[ch], (int, float)):
+                continue
+            china, russia = r[cchina], r[crussia]
+            K = assumed * 100 if china is None and russia is None else min(100.0, _num(china) + _num(russia))
+            self.obtainability[r[1]] = r[ch] / 100 * (W + (1 - W) * K / 100)
+
+    def _price(self, Z: int, A: int, I: int, flags: list[str]) -> float | None:
+        name = nuclide_name(Z, A, I)
+        hit = self.isotope_price.get((Z, A, I))
+        if hit is None and Z in self.element_price:
+            hit = self.element_price[Z]
+            flags.append(f"{name}: element-level price used (no isotope row)")
+        if hit is None:
+            return None
+        price, region = hit
+        if not region.startswith("United States"):
+            flags.append(f"{name}: price is from '{region}', not the U.S. market")
+        return self.log_normalised(price)
+
+    def log_normalised(self, price: float) -> float:
+        """Sheet column I: price (USD/g) on a log scale between the sheet's min and max -> [0, 1]."""
+        return float((np.log(price) - self._ln_min) / (self._ln_max - self._ln_min))
+
+    def lookup(self, Z: int, A: int, I: int, basis: str) -> tuple[float, list[str]]:
+        """Rarity index (0-1) of nuclide (Z, A, I) on `basis`, plus fallback flags."""
+        flags: list[str] = []
+        name = nuclide_name(Z, A, I)
+        get = {"price": lambda: self._price(Z, A, I, flags),
+               "obtainability": lambda: self.obtainability.get(Z)}
+        other = RARITY_BASES[1 - RARITY_BASES.index(basis)]
+        value = get[basis]()
+        if value is None:
+            value = get[other]()
+            if value is not None:
+                flags.append(f"{name}: no {basis} value, used {other}")
+        if value is None:
+            flags.append(f"{name}: no price or obtainability value, assumed 0")
+            value = 0.0
+        return value, flags
+
+
+def apply_rarity(rows: list[dict], di: Nuclide, index: RarityIndex, basis: str, col: str,
+                 warnings: list[str]) -> None:
+    """Add rarity columns and score = row[col] * weight to every successful row (in place).
+
+    Rarity depends only on the target (P1, ground state) and the DI, so it is looked
+    up once per target; each fallback flag and each target rarer than the DI is
+    reported once in `warnings`.
+    """
+    r_di, di_flags = index.lookup(*di, basis)
+    warnings.extend(f"rarity: {f}" for f in di_flags)
+    per_target: dict[str, tuple[float, float, float, list[str]]] = {}
+    for row in rows:
+        if row["status"] != "ok" or row.get(col) is None:
+            continue
+        name = row["target"]
+        if name not in per_target:
+            Z, A, _ = parse_nuclide(name)
+            r_t, flags = index.lookup(Z, A, 0, basis)
+            delta, weight = rarity_weight(r_t, r_di)
+            per_target[name] = (r_t, delta, weight, flags)
+            warnings.extend(f"rarity: {f}" for f in flags)
+            if delta < 0:
+                warnings.append(f"rarity: target {name} is rarer than the DI "
+                                f"(R = {r_t:.3f} vs {r_di:.3f}); kept with weight {weight:.3f}")
+        r_t, delta, weight, flags = per_target[name]
+        row.update(R_target=r_t, R_DI=r_di, delta_R=delta, rarity_weight=weight,
+                   score=row[col] * weight, rarity_flags="; ".join(di_flags + flags))
+
+
+def rarity_weight(r_target: float, r_di: float) -> tuple[float, float]:
+    """Delta = R_DI - R_target in [-1, 1] and weight (1 + Delta) / 2 in [0, 1].
+
+    Delta < 0 means the starting material is rarer than the product; the route is
+    kept but its score is scaled down (weight 0 when the target is maximally rare
+    and the product is not rare at all).
+    """
+    delta = r_di - r_target
+    return delta, (1.0 + delta) / 2.0
+
+
+# ----------------------------------------------------------------------------
+# Eback from target thickness (charged particles)
+# ----------------------------------------------------------------------------
+
+class EbackSolver:
+    """Exit energy of a charged beam after a fixed target thickness.
+
+    The beam loses energy as dE/dx = -S(E), with S the code's own Bethe-Bloch
+    stopping power (rates.stoppingpower, manual Sec. 4). The path length to
+    slow from Ebeam to Eback is
+
+        L(Ebeam, Eback) = integral_{Eback}^{Ebeam} dE / S(E)      [cm]
+
+    which is the same quantity ISOTOPIA reports as Leff. With the residual
+    range R(E) = integral_{E_floor}^{E} dE'/S(E'), the exit energy for a
+    thickness d is Eback = R^-1(R(Ebeam) - d).
+
+    The Bethe-Bloch formula is only valid above its maximum; below it the
+    formula falls to zero and then goes negative (unphysical). E_floor is
+    therefore set to the energy of the maximum of S(E). If the beam's range
+    is shorter than d, the beam stops in the target and Eback = E_floor.
+    """
+
+    def __init__(self, k0: int, Z: int, A: int, emax: float = 250.0, npts: int = 4000):
+        st = State()
+        st.k0, st.Ztarget, st.Atarget = k0, Z, A
+        st.rho_target = RHOTABLE[Z - 1]         # ISOTOPIA default density (reacinitial.f90)
+        # Locate the stopping-power maximum on a fine log grid, 1 keV to emax
+        E = np.geomspace(1e-3, emax, npts)
+        with np.errstate(all="ignore"):
+            Sp = np.array([float(stoppingpower(st, e)) for e in E])
+        self.E_floor = float(E[np.nanargmax(Sp)])
+        # Residual range R(E) above the floor (cumulative trapezoid of 1/S)
+        self.E = E[E >= self.E_floor]
+        self.R = cumulative_trapezoid(1.0 / Sp[E >= self.E_floor], self.E, initial=0.0)
+
+    def eback(self, ebeam: float, thickness: float) -> tuple[float, bool]:
+        """Exit energy (MeV) for beam energy `ebeam` (MeV) and `thickness` (cm).
+
+        Returns (Eback, stopped); stopped is True if the beam stops in the target.
+        """
+        r_back = np.interp(ebeam, self.E, self.R) - thickness
+        if r_back <= 0.0:
+            return self.E_floor, True
+        return float(np.interp(r_back, self.R, self.E)), False
+
+
+# ----------------------------------------------------------------------------
+# One ISOTOPIA run
+# ----------------------------------------------------------------------------
+
+@dataclass
+class RunSpec:
+    """Everything a worker needs for one run (picklable for multiprocessing)."""
+    di: Nuclide
+    k0: int
+    target: Target
+    ebeam: float | None          # MeV; None for neutrons
+    eback: float | None          # MeV; charged particles only
+    lines: list[str]
+    exclude: set[Nuclide] = field(default_factory=set)
+    molar_mass: float = 0.0      # g/mol of the DI, from molar_mass()
+
+
+def di_key(st: State, di: Nuclide) -> tuple[int, int, int] | None:
+    """ISOTOPIA key for the DI. Ground state is stored as 'total' (-1) when
+    the library has no isomer for that Z, A. Returns None if the state is absent."""
+    Z, A, I = di
+    n_isomer = st.Nisomer[(Z, A)]
+    if I in (0, None) and n_isomer == -1:
+        return (Z, A, -1)
+    if I is not None and I > n_isomer:
+        return None
+    return (Z, A, -1 if I is None else I)
+
+
+def precursors(st: State, di: Nuclide) -> list[tuple[int, int, int]]:
+    """Parents that feed the DI by decay in the model (kinetics.equations, step 2):
+    same A, Z-1 with rtyp 1 (beta-) or Z+1 with rtyp 2 (beta+), produced in this run."""
+    Z, A, _ = di
+    found = []
+    for isob, rt in ((-1, 1), (1, 2)):
+        Zp = Z + isob
+        for is_p in range(-1, st.Nisomer[(Zp, A)] + 1):
+            pkey = (Zp, A, is_p)
+            if st.rtyp[pkey] == rt and float(st.reaction_rate[pkey]) > 0:
+                found.append(pkey)
+    return found
+
+
+def run_one(spec: RunSpec) -> dict:
+    """Run isotopia_py once and extract the DI masses; never raises."""
+    t = spec.target
+    row = {"projectile": PARSYM[spec.k0], "target": t.name, "stable": t.stable,
+           "Ebeam_MeV": spec.ebeam, "Eback_MeV": spec.eback, "Leff_cm": None,
+           "m_rate": None, "m_rate_unit": rate_unit(spec.k0),
+           "m_EOI_g": None, "m_EOC_g": None, "status": "ok", "note": ""}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            st = run(spec.lines, out=io.StringIO(), outdir=tmp)
+    except (IsotopiaError, OSError, ValueError) as exc:
+        row.update(status="error", note=" ".join(str(exc).split()))
+        return row
+    if spec.k0 > 1:
+        row["Leff_cm"] = float(st.Leff)
+
+    # Exclusion: precursors that feed the DI in this run
+    for pkey in precursors(st, spec.di):
+        hit = listed(*pkey, spec.exclude)
+        if hit:
+            row.update(status="excluded", note=f"precursor {nuclide_name(*hit)} on exclusion list")
+            return row
+
+    key = di_key(st, spec.di)
+    if key is None:
+        row.update(status="not_produced",
+                   note="no positive DI cross section between Eback and Ebeam for this target")
+        return row
+
+    # Masses from ISOTOPIA's atom counts N_DI(t) (st.Niso, kinetics.equations):
+    # m = N * M / N_A. Atom counts exist for stable and radioactive nuclides alike.
+    N = st.Niso[key]
+    g_per_atom = spec.molar_mass / float(AVOGADRO)
+    i_eoc = NUMTIME if st.Tco > 0 else st.Ntime   # with Tcool = 0 there is no cooling grid
+    row["m_EOI_g"] = float(N[st.Ntime]) * g_per_atom
+    row["m_EOC_g"] = float(N[i_eoc]) * g_per_atom
+
+    # Initial mass production rate: slope of N over the first time step, the
+    # same finite difference ISOTOPIA uses for its activity yield (kinetics.activities),
+    # normalised the same way: per mA of beam (charged) or per g of target (n, g).
+    dt_h = float(st.Tgrid[1] - st.Tgrid[0]) / 3600.0
+    per = float(st.Ibeam) * 1e3 if spec.k0 > 1 else float(st.M_target)   # mA or g
+    row["m_rate"] = float(N[1] - N[0]) * g_per_atom / (per * dt_h)
+    return row
+
+
+def rate_unit(k0: int) -> str:
+    """Unit of m_rate for projectile index k0 (matches ISOTOPIA's yield normalisation)."""
+    return "g/(mA h)" if k0 > 1 else "g/(g h)"
+
+
+# ----------------------------------------------------------------------------
+# Building the scan
+# ----------------------------------------------------------------------------
+
+def energy_grid(emin: float, emax: float, de: float) -> np.ndarray:
+    """Linear grid emin, emin + de, ... <= emax (MeV)."""
+    n = int(np.floor((emax - emin) / de + 1e-9))
+    return emin + de * np.arange(n + 1)
+
+
+def base_lines(t: Target, k0: int, args) -> list[str]:
+    """ISOTOPIA input keywords shared by every run on this target (manual Sec. 6)."""
+    lines = [f"projectile {PARSYM[k0]}", f"element {nuc(t.Z).strip()}", f"mass {t.A}",
+             f"Ibeam {args.ibeam}", f"Tirrad {args.tirrad}", f"Tcool {args.tcool}"]
+    if k0 <= 1:
+        lines.append(f"thickness {args.thickness}")
+    if k0 == 1 and args.flux is not None:
+        lines.append(f"fluxtotal {args.flux}")
+    return lines
+
+
+def build_specs(di: Nuclide, k0: int, targets: list[Target], grid: np.ndarray,
+                args, exclude: set[Nuclide], warnings: list[str]) -> tuple[list[RunSpec], list[dict]]:
+    """All runs for one projectile, plus pre-filled rows for routes skipped before running."""
+    specs, skipped = [], []
+    p = PARSYM[k0]
+    for t in targets:
+        hit = listed(t.Z, t.A, 0, exclude)
+        if hit:
+            skipped.append({"projectile": p, "target": t.name, "stable": t.stable,
+                            "status": "excluded", "note": f"target {nuclide_name(*hit)} on exclusion list"})
+            continue
+        lines = base_lines(t, k0, args)
+        if k0 == 1:                                   # neutrons: spectrum independent of Ebeam
+            specs.append(RunSpec(di, k0, t, None, None, lines, exclude))
+        elif k0 == 0:                                 # photons: integer spectra 1..200 MeV
+            for e in sorted({int(e) for e in grid if e >= 1.0}):
+                specs.append(RunSpec(di, k0, t, float(e), None, lines + [f"Ebeam {e}."], exclude))
+        else:                                         # charged particles: Eback from thickness
+            solver = EbackSolver(k0, t.Z, t.A)
+            n_low = n_stop = 0
+            for e in grid:
+                if e <= solver.E_floor:
+                    n_low += 1
+                    continue
+                eback, stopped = solver.eback(float(e), args.thickness)
+                n_stop += stopped
+                if eback >= e:
+                    continue
+                specs.append(RunSpec(di, k0, t, float(e), eback,
+                                     lines + [f"Ebeam {e:.6f}", f"Eback {eback:.6f}"], exclude))
+            if n_low:
+                warnings.append(f"{p}+{t.name}: {n_low} energies <= {solver.E_floor:.3f} MeV skipped "
+                                "(below the Bethe-Bloch maximum; stopping power invalid)")
+            if n_stop:
+                warnings.append(f"{p}+{t.name}: beam stops in the {args.thickness} cm target at "
+                                f"{n_stop} energies; Eback clipped to {solver.E_floor:.3f} MeV")
+    if k0 == 1:
+        warnings.append("n: reactor spectrum does not depend on Ebeam; one run per target, no energy scan")
+    if k0 == 0:
+        warnings.append("g: bremsstrahlung spectra exist only for integer 1-200 MeV; "
+                        "grid reduced to distinct integer energies >= 1 MeV")
+    return specs, skipped
+
+
+def library_emin(crosspath: str, k0: int, t: Target) -> float | None:
+    """Lowest energy in the target's non-elastic file (MT005, or MT003 for neutrons), MeV."""
+    mt = "MT003" if k0 == 1 else "MT005"
+    nucname = f"{nuc(t.Z).strip()}{t.A:03d}"
+    f = Path(crosspath) / PARSYM[k0] / nucname / "iaea.2026" / "tables" / "xs" / \
+        f"{PARSYM[k0]}-{nucname}-{mt}.iaea.2026"
+    if not f.exists():
+        return None
+    for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.strip() and not line.startswith("#"):
+            return float(line.split()[0])
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Output
+# ----------------------------------------------------------------------------
+
+CSV_FIELDS = ["projectile", "target", "stable", "Ebeam_MeV", "Eback_MeV", "Leff_cm",
+              "m_rate", "m_rate_unit", "m_EOI_g", "m_EOC_g",
+              "R_target", "R_DI", "delta_R", "rarity_weight", "score", "rarity_flags", "status", "note"]
+
+# Ranking options: --metric name -> (CSV column, description)
+METRICS = {
+    "eoc": ("m_EOC_g", "DI mass at end of cooling [g]"),
+    "eoi": ("m_EOI_g", "DI mass at end of irradiation [g]"),
+    "rate": ("m_rate", "initial mass production rate [g/(mA h); g/(g h) for n and g]"),
+}
+
+ASSUMPTIONS = """\
+Assumptions and limitations
+- Reported for every route: DI mass at EOI and at end of cooling (last point of
+  ISOTOPIA's time grid), and the initial mass production rate. Ranking uses the
+  chosen metric. Masses are m = N * M / N_A, with N the atom count ISOTOPIA
+  computes and M = AWR * m_n read from the DI's record in files/decay/zZZZ.
+- Stable and radioactive DIs are treated alike. Masses are of the DI alone: for a
+  stable DI, other isotopes of the same element (including the target, if it is
+  the same element) cannot be separated chemically, and isotopic purity is not
+  reported yet.
+- The mass rate is per mA h of beam for charged particles; for neutrons and
+  photons ISOTOPIA normalises per gram of target, so rates are not comparable
+  across those groups.
+- Targets: mass number A_DI-5..A_DI+5, ground state, with a cross-section library;
+  only Z and A inside ISOTOPIA's residual window (Zcomp+1 .. Zcomp-Zdepth,
+  Acomp .. Acomp-Adepth); lighter targets need A + A_projectile >= A_DI.
+- Charged particles: Eback from a fixed thickness using ISOTOPIA's Bethe-Bloch
+  stopping power and default density; Leff_cm is the path length ISOTOPIA itself
+  computed (100-bin midpoint rule) and may differ slightly from the thickness.
+- Decay physics is the Phase 1 port of equations.f90, including its known defects
+  (claude/equations_f90_findings.md): beta- parents do NOT feed daughters during
+  cooling, no branching ratios, double-counted parent feeding, no isomeric
+  transition. End-of-cooling masses of DIs fed by beta- decay (including stable
+  DIs made mostly by decay) are therefore underestimated; compare m_EOI_g.
+- Exclusion checks the target and the one-step decay precursors ISOTOPIA models;
+  longer chains are not tracked by the code.
+- Radiotoxicity and processing time are not part of the ranking yet.
+- Rarity (only with --rarity): index from the team workbook, U.S. market prices
+  (log-normalised over the whole sheet) or U.S. obtainability; region selection is
+  not possible because the workbook holds one value per element. Element prices
+  stand in for isotopes without their own row, so enriched targets (e.g. Mo-100)
+  are scored as the natural element and their rarity is underestimated.
+"""
+
+
+def _fmt(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        return f"{v:.6e}" if abs(v) >= 1e4 or (v != 0 and abs(v) < 1e-2) else f"{v:.6f}"
+    return str(v)
+
+
+def best_per_route(rows: list[dict], col: str) -> dict[tuple[str, str], dict]:
+    """Row with the largest `col` value for each (projectile, target) route."""
+    best: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        k = (r["projectile"], r["target"])
+        if k not in best or r[col] > best[k][col]:
+            best[k] = r
+    return best
+
+
+def _route(r: dict, di_name: str) -> str:
+    """One-line route description, e.g. 'Mo100(p,x)Tc99_m1 at Ebeam = 20 MeV'."""
+    e = "reactor spectrum" if r["Ebeam_MeV"] is None else f"Ebeam = {r['Ebeam_MeV']:.4g} MeV"
+    return f"{r['target']}({r['projectile']},x){di_name} at {e}"
+
+
+def write_outputs(outdir: Path, di_name: str, rows: list[dict], warnings: list[str], args) -> str:
+    """Write scan.csv and summary.txt; return the summary text."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    with open(outdir / "scan.csv", "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: _fmt(r.get(k)) for k in CSV_FIELDS})
+
+    col, desc = METRICS[args.metric]
+    ok = [r for r in rows if r["status"] == "ok" and r[col] is not None]
+    settings = (f"Projectiles: {' '.join(args.projectile)}   grid: {args.emin}-{args.emax} MeV, "
+                f"step {args.de} MeV   thickness: {args.thickness} cm")
+    beam = (f"Ibeam: {args.ibeam} mA   Tirrad: {args.tirrad}   Tcool: {args.tcool}   "
+            f"exclusion list: {args.exclude or 'none'}")
+    out = [f"Optimal route search for {di_name}", "", settings, beam,
+           f"Ranked by: {desc}", "", ASSUMPTIONS]
+
+    # Best energy per (projectile, target) under the chosen metric, then rank the routes.
+    # The rarity weight is the same for every energy of a route, so it changes the
+    # order of routes but never which energy is best for a route.
+    best = best_per_route(ok, col)
+    key = "score" if args.rarity else col
+    ranked = sorted(best.values(), key=lambda r: r[key], reverse=True)
+    if args.rarity:
+        desc = f"{desc} x rarity weight ({args.rarity_basis})"
+    out.append(f"Best energy per route (ranked by {desc})")
+    out.append(f"{'proj':>4} {'target':>8} {'stable':>6} {'Ebeam':>9} {'Eback':>9} "
+               f"{'rate':>11} {'rate unit':>10} {'m_EOI [g]':>11} {'m_EOC [g]':>11}"
+               + (f" {'R_tgt':>6} {'dR':>6} {'weight':>6} {'score':>11}" if args.rarity else ""))
+    for r in ranked:
+        line = (f"{r['projectile']:>4} {r['target']:>8} {'yes' if r['stable'] else 'no':>6} "
+                f"{_fmt(r['Ebeam_MeV']):>9} {_fmt(r['Eback_MeV']):>9} "
+                f"{r['m_rate']:11.4e} {r['m_rate_unit']:>10} {r['m_EOI_g']:11.4e} {r['m_EOC_g']:11.4e}")
+        if args.rarity:
+            line += (f" {r['R_target']:6.3f} {r['delta_R']:+6.3f} {r['rarity_weight']:6.3f} {r['score']:11.4e}"
+                     + ("  <- target rarer than DI" if r["delta_R"] < 0 else ""))
+        out.append(line)
+    out.append("")
+    if ranked and ranked[0][key] > 0:
+        r = ranked[0]
+        extra = f", rarity weight = {r['rarity_weight']:.3f}" if args.rarity else ""
+        out.append(f"OPTIMAL ({args.metric}{' + rarity' if args.rarity else ''}): {_route(r, di_name)}, "
+                   f"m_EOC = {r['m_EOC_g']:.4e} g, rate = {r['m_rate']:.4e} {r['m_rate_unit']}{extra}")
+    else:
+        out.append("OPTIMAL: none - no route produced the DI")
+
+    # Cross-check: the best route under every metric. Disagreement means half-life
+    # and timing, not the cross section alone, are deciding the choice.
+    out.append("Best route under each metric:")
+    for name, (c, _) in METRICS.items():
+        cands = [r for r in ok if r[c] is not None and r[c] > 0]
+        top = max(cands, key=lambda r: r[c]) if cands else None
+        out.append(f"  {name:>5}: {_route(top, di_name) if top else 'none'}")
+    out.append("")
+
+    # Counts of non-ok runs, then warnings
+    for status in ("excluded", "not_produced", "no_data", "error"):
+        n = sum(r["status"] == status for r in rows)
+        if n:
+            out.append(f"{n} runs with status '{status}' (see scan.csv)")
+    never = sorted({(r["projectile"], r["target"]) for r in rows} - set(best))
+    if never:
+        out.append("Routes with no usable result at any energy: "
+                   + ", ".join(f"{t}({p},x)" for p, t in never))
+    out.append("")
+    out.append("Warnings")
+    if warnings:
+        out.extend(f"- {w}" for w in warnings)
+    else:
+        out.append("- none")
+    text = "\n".join(out) + "\n"
+    (outdir / "summary.txt").write_text(text, encoding="utf-8")
+    return text
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("di", help="desired isotope, e.g. Tc99_m1, Cu64, Tc99_g")
+    ap.add_argument("-p", "--projectile", nargs="+", required=True, choices=PARSYM,
+                    help="projectile(s): g n p d t h a")
+    ap.add_argument("--emin", type=float, default=0.001, help="lowest beam energy [MeV] (default 0.001)")
+    ap.add_argument("--emax", type=float, default=200.0, help="highest beam energy [MeV] (default 200)")
+    ap.add_argument("--de", type=float, required=True, help="energy step [MeV]")
+    ap.add_argument("--thickness", type=float, default=0.05,
+                    help="target thickness [cm] (default 0.05, the ISOTOPIA default)")
+    ap.add_argument("--ibeam", type=float, default=1.0, help="beam current [mA] (default 1)")
+    ap.add_argument("--tirrad", default="1 d", help="irradiation time, ISOTOPIA syntax (default '1 d')")
+    ap.add_argument("--tcool", default="1 d", help="cooling time, ISOTOPIA syntax (default '1 d')")
+    ap.add_argument("--flux", type=float, default=None, help="neutron flux [cm^-2 s^-1] (n only)")
+    ap.add_argument("--exclude", default=None, help="text file of nuclides that exclude a route")
+    ap.add_argument("--include-radioactive", action="store_true",
+                    help="also use non-naturally-occurring (radioactive) targets")
+    ap.add_argument("--metric", choices=list(METRICS), default="eoc",
+                    help="ranking: eoc = DI mass at end of cooling (default), eoi = DI mass at "
+                         "end of irradiation, rate = initial mass production rate")
+    ap.add_argument("--rarity", default=None, metavar="WORKBOOK",
+                    help="weight the ranking by rarity from the team price/obtainability workbook (.xlsx)")
+    ap.add_argument("--rarity-basis", choices=RARITY_BASES, default="price",
+                    help="rarity basis (default price); the other basis is the fallback")
+    ap.add_argument("--jobs", type=int, default=1, help="parallel worker processes (default 1)")
+    ap.add_argument("--out", default=None, help="output directory (default runs/optimal_route/<DI>)")
+    args = ap.parse_args(argv)
+    if not 0 < args.emin < args.emax <= 200.0:
+        ap.error("need 0 < emin < emax <= 200 MeV (library upper limit)")
+    if args.de <= 0 or args.thickness <= 0:
+        ap.error("--de and --thickness must be positive")
+    return args
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    di = parse_nuclide(args.di)
+    if di[2] is None:
+        di = (di[0], di[1], 0)                 # bare DI name means the ground state
+    di_name = nuclide_name(*di)
+    exclude = read_nuclide_list(args.exclude) if args.exclude else set()
+    warnings: list[str] = []
+    if listed(*di, exclude):
+        warnings.append(f"the DI {di_name} itself is on the exclusion list")
+    groups = {p in "pdtha" for p in args.projectile}
+    if args.metric == "rate" and len(groups) > 1:
+        warnings.append("--metric rate mixes g/(mA h) (charged particles) with g/(g h) "
+                        "(n, g); the ranking across those groups is not meaningful")
+
+    paths = State()
+    machine(paths)                             # resolves ISOTOPIA_DIR / ISOTOPIA_LIBS
+    try:
+        M_di = molar_mass(paths.path, di[0], di[1])   # g/mol, from the decay library
+    except LookupError as exc:
+        print(f"error: cannot convert atoms to grams for {di_name}: {exc}", file=sys.stderr)
+        return 1
+    grid = energy_grid(args.emin, args.emax, args.de)
+    specs: list[RunSpec] = []
+    rows: list[dict] = []
+    for p in dict.fromkeys(args.projectile):
+        k0 = PARSYM.index(p)
+        targets = candidate_targets(di, k0, paths.path, paths.crosspath,
+                                    args.include_radioactive, warnings)
+        if not targets:
+            warnings.append(f"{p}: no candidate targets with A = {di[1] - MASS_WINDOW}..{di[1] + MASS_WINDOW} "
+                            f"in {paths.crosspath}{p}/")
+        for t in targets:
+            emin_lib = library_emin(paths.crosspath, k0, t)
+            if emin_lib is not None and k0 != 1 and args.emin < emin_lib:
+                warnings.append(f"{p}+{t.name}: library cross sections start at {emin_lib:g} MeV; "
+                                "lower beam energies give zero reaction rates")
+        s, skipped = build_specs(di, k0, targets, grid, args, exclude, warnings)
+        for spec in s:
+            spec.molar_mass = M_di
+        specs += s
+        rows += skipped
+
+    print(f"{di_name}: {len(specs)} runs on {len({(s.k0, s.target) for s in specs})} routes", file=sys.stderr)
+    if args.jobs > 1:
+        with ProcessPoolExecutor(args.jobs) as pool:
+            rows += list(pool.map(run_one, specs, chunksize=8))
+    else:
+        rows += [run_one(s) for s in specs]
+    for r in rows:
+        if r["status"] == "error":
+            warnings.append(f"{r['projectile']}+{r['target']} at {r.get('Ebeam_MeV')} MeV: {r['note']}")
+    if args.rarity:
+        apply_rarity(rows, di, RarityIndex(args.rarity), args.rarity_basis, METRICS[args.metric][0], warnings)
+
+    outdir = Path(args.out) if args.out else ROOT / "runs" / "optimal_route" / di_name
+    print(write_outputs(outdir, di_name, rows, warnings, args))
+    print(f"results in {outdir}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

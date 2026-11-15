@@ -1,0 +1,128 @@
+OPTIMAL ROUTE SEARCH, VERSION 3 (RARITY WEIGHTING): OPEN CONCERNS
+Script: optimal_route_v3_rarity_weighting.py   Tests: test_optimal_route_v3_rarity_weighting.py
+Rarity data: Element_Prices_per_Gram_USD.xlsx (team workbook, 6 Nov 2026 version)
+
+Versions
+  v1  ranks routes by DI activity; targets A..A+5, later A-5..A+5; reports yield Y
+  v2  reports DI mass instead of activity/yield; stable DIs supported
+  v3  adds rarity weighting (--rarity, --rarity-basis), this file
+
+
+1. RARITY DATA (for Brett / the database)
+
+1.1 No region choice.
+    The Rarity Index Structure diagram has a region step (China, Europe, U.S.),
+    but the workbook holds one price per element, and the market behind that
+    price varies by row (mostly U.S.; some European, Chinese, Canadian or global
+    benchmark prices). Obtainability is U.S.-only. The script therefore has no
+    --region option; non-U.S. prices are flagged instead.
+
+1.2 Enriched and radioactive targets look too cheap.
+    Only 9 isotope rows exist (deuterium, Tc-99m, U-233, U-235, Pu-242, Pu-244,
+    Am-243, Cm-248, Cf-249) plus the "main isotope" rows of radioactive-only
+    elements. Every other isotope uses its element's natural price. Example:
+    Mo-100 is scored as natural molybdenum, though enriched Mo-100 costs far
+    more; Mo-99 (itself radioactive) is also scored as natural Mo. Target rarity
+    is understated, which favours enriched targets. Nearly every route currently
+    carries an "element-level price used" flag for this reason.
+    Fix: add isotope-specific prices for common enriched targets.
+
+1.3 Obtainability exists only per element.
+    So an isotope-level obtainability value is never available. This case is not
+    flagged, since the flag would appear on every route and carry no information.
+
+1.4 Technetium has no obtainability score.
+    With --rarity-basis obtainability, Tc falls back to its price (flagged).
+
+1.5 The workbook has formulas but no cached values.
+    It was never recalculated and saved in Excel, so the script re-evaluates the
+    formulas itself. Verified against a LibreOffice recalculation: all 102 price
+    rows and 79 obtainability rows agree to ~1e-16. If the sheet's formulas or
+    column headers change, RarityIndex must be updated to match.
+
+1.6 The price index depends on the whole sheet.
+    It is normalised between the cheapest and most expensive rows (isotope rows
+    included), so adding or repricing any row shifts every index value.
+
+1.7 New dependency: openpyxl.
+    Needed only when --rarity is used; not one of the project's core packages
+    (numpy, scipy). Alternative: export the two sheets to CSV.
+
+
+2. RARITY WEIGHTING METHOD
+
+2.1 Score = mass x (1 + dR)/2, with dR = R_DI - R_target in [-1, 1].
+    Equal rarity (dR = 0) halves the score, so scores are not masses. Ranking is
+    correct, but always read the unweighted mass column (m_EOC_g) for amounts.
+
+2.2 Only the target (P1) and the DI are scored.
+    Decay precursors and co-produced nuclides do not affect the weight.
+
+2.3 Targets rarer than the DI are kept, not dropped.
+    They are scored lower and flagged "target rarer than DI". The manual
+    exclusion list (--exclude) still drops routes and works independently.
+
+
+3. PHYSICS AND MODEL LIMITS (inherited from the ISOTOPIA port)
+   Details: claude/equations_f90_findings.md
+
+3.1 Beta-minus parents do not feed daughters during cooling (defect 4).
+    End-of-cooling masses are underestimated for DIs fed by beta- decay, e.g.
+    Tc-99m from Mo-99, and stable products made mostly through decay
+    (Mo-100 -> Tc-100 -> Ru-100). Compare m_EOI_g where this matters.
+
+3.2 Only one step of decay feeding; no branching ratios; parent feeding
+    double-counted; no isomeric transition (defects 1-3).
+
+3.3 Long-lived parents are numerically fragile (defect 6, the Ru-099 anomaly).
+
+3.4 No isotopic purity for stable DIs.
+    The reported mass is the DI alone. Other isotopes of the same element
+    (including the target, if the same element) cannot be separated chemically.
+
+3.5 Mass production rates use different units by beam type:
+    g/(mA h) for charged particles, g/(g target h) for neutrons and photons.
+    The script warns if --metric rate mixes them.
+
+
+4. SEARCH SETUP
+
+4.1 Target window A-5..A+5 is a chosen rule, not derived.
+    Lighter targets that cannot reach the DI mass in one reaction
+    (A_target + A_projectile < A_DI) are skipped with a warning.
+
+4.2 The DI's own ground state is never used as a target
+    (its inventory is unreacted target, not production). An isomeric DI from its
+    own ground state (Tc-99 -> Tc-99m) is kept.
+
+4.3 Low energies are mostly empty.
+    The Bethe-Bloch stopping power is invalid below ~0.5 MeV (protons), and
+    charged-particle cross sections start at 0.5 MeV, so the 1 keV lower bound
+    yields no usable runs there.
+
+4.4 Fixed target thickness and default density; Eback derived from them.
+    No heat-load limit is applied.
+
+4.5 Photons: only integer 1-200 MeV spectra. Neutrons: fixed reactor spectrum,
+    one run per target, no energy scan.
+
+4.6 Fixed irradiation time, cooling time and beam current (defaults 1 d, 1 d,
+    1 mA); rankings can change with these.
+
+4.7 Radiotoxicity and processing time are not part of the ranking yet.
+
+
+5. DATA AND REPOSITORY
+
+5.1 Library file n-Mo100-rp042099.iaea.2026 has energies out of order
+    (14 MeV then 8 MeV); every neutron run on Mo-100 fails because of it.
+    Left unchanged, per project rules.
+
+5.2 Layout does not yet follow the project conventions.
+    The search lives in scripts/ rather than inverse/, and paths come from
+    ISOTOPIA_DIR / ISOTOPIA_LIBS rather than MIDAS_DATA.
+
+5.3 Not pushed to GitHub.
+    This session has no write access to MIDAS-22-033/isotopia_python or
+    romec558/isotopia_python; the branch optimal-route-search (4 commits) exists
+    only in the session. Copy the v3 files into a clone and commit from there.
